@@ -1,0 +1,450 @@
+name: Granny Legacy iOS - v1 IL2CPP RECOVERY CHECK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/granny-legacy-ios.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recover:
+    name: Recover Granny Legacy Unity project + IL2CPP metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            jq \
+            unzip \
+            xz-utils \
+            binutils \
+            file
+
+          rm -rf work tools recovered output granny-recovered.tar.gz
+          mkdir -p work tools recovered output
+
+      - name: Download Granny Legacy APK from newest GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
+
+          if [ -z "$TAG" ]; then
+            echo "ERROR: No GitHub Release exists."
+            echo "Create a Release and upload granny-legacy-v1.2.5-1.apk first."
+            exit 1
+          fi
+
+          echo "Using release: $TAG"
+          mkdir -p work/release
+
+          gh release download "$TAG" \
+            --dir work/release \
+            --pattern "*.apk"
+
+          APK="$(
+            find work/release -type f -iname '*.apk' -printf '%s %p\n' \
+              | sort -nr \
+              | head -1 \
+              | cut -d' ' -f2-
+          )"
+
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found in newest Release."
+            exit 1
+          fi
+
+          cp "$APK" work/GrannyLegacy.apk
+
+          echo "===== APK ====="
+          ls -lh work/GrannyLegacy.apk
+          sha256sum work/GrannyLegacy.apk | tee output/apk-sha256.txt
+
+      - name: Extract APK and inspect Unity / IL2CPP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p work/android
+          unzip -q work/GrannyLegacy.apk -d work/android
+
+          DATA_DIR="work/android/assets/bin/Data"
+          LIBIL2CPP="work/android/lib/arm64-v8a/libil2cpp.so"
+          METADATA="$DATA_DIR/Managed/Metadata/global-metadata.dat"
+
+          if [ ! -d "$DATA_DIR" ]; then
+            echo "ERROR: Unity Data folder missing."
+            exit 1
+          fi
+
+          if [ ! -f "$LIBIL2CPP" ]; then
+            echo "ERROR: ARM64 libil2cpp.so missing."
+            find work/android/lib -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+
+          if [ ! -f "$METADATA" ]; then
+            echo "ERROR: global-metadata.dat missing."
+            find "$DATA_DIR" -maxdepth 5 -type f -print | head -400
+            exit 1
+          fi
+
+          UNITY_VERSION="$(
+            strings "$DATA_DIR/data.unity3d" 2>/dev/null \
+              | grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+' \
+              | head -1 || true
+          )"
+
+          echo "===== DETECTED ====="
+          echo "DATA_DIR=$DATA_DIR"
+          echo "LIBIL2CPP=$LIBIL2CPP"
+          echo "METADATA=$METADATA"
+          echo "UNITY_VERSION=${UNITY_VERSION:-UNKNOWN}"
+
+          file "$LIBIL2CPP"
+          ls -lh "$LIBIL2CPP" "$METADATA" "$DATA_DIR/data.unity3d"
+
+          if [ "$UNITY_VERSION" != "2022.3.62f2" ]; then
+            echo "ERROR: Expected Unity 2022.3.62f2, got ${UNITY_VERSION:-UNKNOWN}"
+            exit 1
+          fi
+
+          printf '%s\n' "$DATA_DIR" > output/data-dir.txt
+          printf '%s\n' "$LIBIL2CPP" > output/libil2cpp-path.txt
+          printf '%s\n' "$METADATA" > output/metadata-path.txt
+          printf '%s\n' "$UNITY_VERSION" > output/unity-version.txt
+
+      - name: Build IL2CPP Dumper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 \
+            https://github.com/rodroidmods/Il2cppdumper-cpp.git \
+            tools/il2cppdumper
+
+          cmake \
+            -S tools/il2cppdumper \
+            -B tools/il2cppdumper/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build tools/il2cppdumper/build -j 2
+
+          DUMPER="$(
+            find tools/il2cppdumper/build -type f \
+              -name 'il2cppdumper' \
+              -perm -111 \
+              | head -1
+          )"
+
+          if [ -z "$DUMPER" ]; then
+            echo "ERROR: il2cppdumper executable not found."
+            find tools/il2cppdumper/build -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          echo "$DUMPER" > output/dumper-path.txt
+          "$DUMPER" --help || true
+
+      - name: Dump IL2CPP metadata and DummyDLLs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DUMPER="$(cat output/dumper-path.txt)"
+          LIBIL2CPP="$(cat output/libil2cpp-path.txt)"
+          METADATA="$(cat output/metadata-path.txt)"
+
+          mkdir -p output/il2cpp-dump
+
+          set +e
+          "$DUMPER" \
+            "$LIBIL2CPP" \
+            "$METADATA" \
+            "$PWD/output/il2cpp-dump" \
+            2>&1 | tee output/il2cpp-dumper.log
+          RC=${PIPESTATUS[0]}
+          set -e
+
+          echo "DUMPER_EXIT_CODE=$RC"
+
+          if [ "$RC" -ne 0 ]; then
+            echo "ERROR: IL2CPP dump failed."
+            exit "$RC"
+          fi
+
+          echo "===== IL2CPP OUTPUT ====="
+          find output/il2cpp-dump -maxdepth 3 -type f -printf '%s %p\n' \
+            | sort -nr \
+            | head -200
+
+          DUMMY_ASSEMBLY="$(
+            find output/il2cpp-dump -type f \
+              -iname 'Assembly-CSharp.dll' \
+              | head -1 || true
+          )"
+
+          if [ -z "$DUMMY_ASSEMBLY" ]; then
+            echo "ERROR: Dummy Assembly-CSharp.dll was not generated."
+            exit 1
+          fi
+
+          echo "DUMMY_ASSEMBLY_CSHARP=$DUMMY_ASSEMBLY"
+          ls -lh "$DUMMY_ASSEMBLY"
+
+          {
+            echo "===== MOBILE CONTROL NAMES ====="
+            grep -RaiE \
+              'CustomizedJoystick|CustomizedUse|CustomizedDrop|Joystick|Touch|Mobile|Button' \
+              output/il2cpp-dump \
+              --include='*.cs' \
+              --include='*.json' \
+              --include='*.txt' \
+              | head -300 || true
+          } > output/mobile-controls.txt
+
+      - name: Download AssetRipper 2.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api repos/AssetRipper/AssetRipper/releases/tags/2.0.0 \
+            --jq '.assets[].name' \
+            > output/assetripper-assets.txt
+
+          ASSET="$(
+            grep -Ei '^AssetRipper_linux_(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
+              output/assetripper-assets.txt \
+              | head -1 || true
+          )"
+
+          if [ -z "$ASSET" ]; then
+            ASSET="$(
+              grep -Ei 'linux.*(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
+                output/assetripper-assets.txt \
+                | head -1 || true
+            )"
+          fi
+
+          if [ -z "$ASSET" ]; then
+            echo "ERROR: AssetRipper Linux package not found."
+            cat output/assetripper-assets.txt
+            exit 1
+          fi
+
+          gh release download 2.0.0 \
+            -R AssetRipper/AssetRipper \
+            -p "$ASSET" \
+            -D tools
+
+          mkdir -p tools/assetripper
+
+          case "tools/$ASSET" in
+            *.tar.xz) tar -xJf "tools/$ASSET" -C tools/assetripper ;;
+            *.zip) unzip -q "tools/$ASSET" -d tools/assetripper ;;
+            *)
+              echo "ERROR: unsupported AssetRipper archive"
+              exit 1
+              ;;
+          esac
+
+          RIPPER="$(
+            find tools/assetripper -type f \
+              \( -name AssetRipper.GUI.Free -o -name AssetRipper.GUI -o -name AssetRipper \) \
+              | head -1
+          )"
+
+          if [ -z "$RIPPER" ]; then
+            echo "ERROR: AssetRipper executable not found."
+            find tools/assetripper -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          chmod +x "$RIPPER"
+          echo "$RIPPER" > output/assetripper-path.txt
+
+      - name: Recover Unity assets/project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RIPPER="$(cat output/assetripper-path.txt)"
+          DATA_DIR="$(cat output/data-dir.txt)"
+          EXPORT_DIR="$PWD/recovered/GrannyLegacy"
+          PORT=3333
+
+          mkdir -p "$EXPORT_DIR"
+
+          "$RIPPER" --headless --port "$PORT" \
+            > output/assetripper.log 2>&1 &
+          PID=$!
+
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          READY=0
+          for i in $(seq 1 90); do
+            if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "ERROR: AssetRipper did not start."
+            tail -300 output/assetripper.log || true
+            exit 1
+          fi
+
+          LOAD_CODE="$(
+            curl -sS \
+              -o output/load-response.txt \
+              -w '%{http_code}' \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "Path=$DATA_DIR" \
+              "http://127.0.0.1:${PORT}/LoadFolder"
+          )"
+
+          echo "LOAD_HTTP=$LOAD_CODE"
+
+          if [ "$LOAD_CODE" != "200" ] && [ "$LOAD_CODE" != "302" ]; then
+            cat output/load-response.txt || true
+            tail -300 output/assetripper.log || true
+            exit 1
+          fi
+
+          EXPORT_CODE="$(
+            curl -sS \
+              -o output/export-response.txt \
+              -w '%{http_code}' \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "Path=$EXPORT_DIR" \
+              --data-urlencode 'CreateSubfolder=false' \
+              "http://127.0.0.1:${PORT}/Export/UnityProject"
+          )"
+
+          echo "EXPORT_HTTP=$EXPORT_CODE"
+
+          if [ "$EXPORT_CODE" != "200" ] && [ "$EXPORT_CODE" != "302" ]; then
+            cat output/export-response.txt || true
+            tail -300 output/assetripper.log || true
+            exit 1
+          fi
+
+          cleanup
+          trap - EXIT
+
+          PROJECT=""
+          if [ -d "$EXPORT_DIR/ExportedProject/Assets" ]; then
+            PROJECT="$EXPORT_DIR/ExportedProject"
+          elif [ -d "$EXPORT_DIR/Assets" ]; then
+            PROJECT="$EXPORT_DIR"
+          fi
+
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: recovered project not found."
+            find "$EXPORT_DIR" -maxdepth 4 -type d | head -300
+            exit 1
+          fi
+
+          echo "$PROJECT" > output/project-path.txt
+
+          echo "===== RECOVERY COUNTS ====="
+          echo "PROJECT=$PROJECT"
+          echo "SCENES=$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
+          echo "PREFABS=$(find "$PROJECT/Assets" -type f -name '*.prefab' | wc -l)"
+          echo "MATERIALS=$(find "$PROJECT/Assets" -type f -name '*.mat' | wc -l)"
+          echo "TEXTURES=$(find "$PROJECT/Assets" -type f \( -name '*.png' -o -name '*.tga' -o -name '*.jpg' \) | wc -l)"
+          echo "CS_FILES=$(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
+
+          {
+            echo "Unity version: $(cat output/unity-version.txt)"
+            echo
+            echo "Recovered project: $PROJECT"
+            echo "Scenes: $(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
+            echo "Prefabs: $(find "$PROJECT/Assets" -type f -name '*.prefab' | wc -l)"
+            echo "Materials: $(find "$PROJECT/Assets" -type f -name '*.mat' | wc -l)"
+            echo "C# files exported by AssetRipper: $(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
+            echo
+            echo "IMPORTANT:"
+            echo "This APK uses IL2CPP."
+            echo "DummyDLLs restore type/method metadata, not original executable C# method bodies."
+            echo "A playable iOS build must not be attempted until we verify/recreate the gameplay code."
+          } > output/recovery-report.txt
+
+          cat output/recovery-report.txt
+
+      - name: Pack recovered project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(cat output/project-path.txt)"
+
+          tar \
+            --exclude='Library' \
+            --exclude='Temp' \
+            --exclude='obj' \
+            -czf granny-recovered.tar.gz \
+            -C "$(dirname "$PROJECT")" \
+            "$(basename "$PROJECT")"
+
+          ls -lh granny-recovered.tar.gz
+
+      - name: Upload recovered Unity project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Granny-Legacy-Recovered-Unity-v1
+          path: granny-recovered.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload IL2CPP dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: Granny-Legacy-IL2CPP-Dump-v1
+          path: |
+            output/il2cpp-dump
+            output/il2cpp-dumper.log
+            output/mobile-controls.txt
+            output/recovery-report.txt
+          if-no-files-found: warn
+          compression-level: 6
+
+      - name: Upload recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Granny-Legacy-Recovery-Diagnostics-v1
+          path: |
+            output
+          if-no-files-found: warn
+          compression-level: 6
