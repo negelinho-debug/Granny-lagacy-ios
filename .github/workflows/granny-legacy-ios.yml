@@ -1,450 +1,543 @@
-name: Granny Legacy iOS - v1 IL2CPP RECOVERY CHECK
+name: Granny Legacy iOS - v2 FIRST iOS BUILD
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/granny-legacy-ios.yml"
 
 permissions:
   contents: read
   actions: read
 
 jobs:
-  recover:
-    name: Recover Granny Legacy Unity project + IL2CPP metadata
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+  build_ios:
+    name: Download recovered project + try first iOS IPA
+    runs-on: macos-latest
+    timeout-minutes: 150
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UNITY_EMAIL: ${{ secrets.UNITY_USERNAME }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare tools
+      - name: Find latest successful v1 run
         shell: bash
         run: |
           set -euo pipefail
 
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            ninja-build \
-            git \
-            curl \
-            jq \
-            unzip \
-            xz-utils \
-            binutils \
-            file
+          RUN_ID="$(
+            gh run list \
+              --workflow granny-legacy-ios.yml \
+              --status success \
+              --limit 20 \
+              --json databaseId,name,displayTitle,createdAt \
+              --jq '.[0].databaseId'
+          )"
 
-          rm -rf work tools recovered output granny-recovered.tar.gz
-          mkdir -p work tools recovered output
-
-      - name: Download Granny Legacy APK from newest GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
-
-          if [ -z "$TAG" ]; then
-            echo "ERROR: No GitHub Release exists."
-            echo "Create a Release and upload granny-legacy-v1.2.5-1.apk first."
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "ERROR: Could not find a successful previous run."
             exit 1
           fi
 
-          echo "Using release: $TAG"
-          mkdir -p work/release
+          echo "SOURCE_RUN_ID=$RUN_ID"
+          echo "$RUN_ID" > source-run-id.txt
 
-          gh release download "$TAG" \
-            --dir work/release \
-            --pattern "*.apk"
+      - name: Download recovered Unity project from v1
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          APK="$(
-            find work/release -type f -iname '*.apk' -printf '%s %p\n' \
-              | sort -nr \
+          RUN_ID="$(cat source-run-id.txt)"
+
+          rm -rf recovered-download il2cpp-download recovered-project build output DerivedData
+          mkdir -p recovered-download il2cpp-download recovered-project build output
+
+          gh run download "$RUN_ID" \
+            -n "Granny-Legacy-Recovered-Unity-v1" \
+            -D recovered-download
+
+          # IL2CPP dump is downloaded too for diagnostics.
+          gh run download "$RUN_ID" \
+            -n "Granny-Legacy-IL2CPP-Dump-v1" \
+            -D il2cpp-download || true
+
+          echo "===== RECOVERED ARTIFACT ====="
+          find recovered-download -maxdepth 3 -type f -print
+
+          ARCHIVE="$(
+            find recovered-download -type f \
+              \( -name '*.tar.gz' -o -name '*.tgz' \) \
+              | head -1
+          )"
+
+          if [ -z "$ARCHIVE" ]; then
+            echo "ERROR: recovered project archive not found."
+            exit 1
+          fi
+
+          tar -xzf "$ARCHIVE" -C recovered-project
+
+          PROJECT="$(
+            find recovered-project -type f \
+              -path '*/ProjectSettings/ProjectVersion.txt' \
+              -print \
               | head -1 \
-              | cut -d' ' -f2-
+              | xargs -I{} dirname {} \
+              | xargs -I{} dirname {}
           )"
 
-          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-            echo "ERROR: APK not found in newest Release."
-            exit 1
-          fi
-
-          cp "$APK" work/GrannyLegacy.apk
-
-          echo "===== APK ====="
-          ls -lh work/GrannyLegacy.apk
-          sha256sum work/GrannyLegacy.apk | tee output/apk-sha256.txt
-
-      - name: Extract APK and inspect Unity / IL2CPP
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p work/android
-          unzip -q work/GrannyLegacy.apk -d work/android
-
-          DATA_DIR="work/android/assets/bin/Data"
-          LIBIL2CPP="work/android/lib/arm64-v8a/libil2cpp.so"
-          METADATA="$DATA_DIR/Managed/Metadata/global-metadata.dat"
-
-          if [ ! -d "$DATA_DIR" ]; then
-            echo "ERROR: Unity Data folder missing."
-            exit 1
-          fi
-
-          if [ ! -f "$LIBIL2CPP" ]; then
-            echo "ERROR: ARM64 libil2cpp.so missing."
-            find work/android/lib -maxdepth 3 -type f -print || true
-            exit 1
-          fi
-
-          if [ ! -f "$METADATA" ]; then
-            echo "ERROR: global-metadata.dat missing."
-            find "$DATA_DIR" -maxdepth 5 -type f -print | head -400
-            exit 1
-          fi
-
-          UNITY_VERSION="$(
-            strings "$DATA_DIR/data.unity3d" 2>/dev/null \
-              | grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+' \
-              | head -1 || true
-          )"
-
-          echo "===== DETECTED ====="
-          echo "DATA_DIR=$DATA_DIR"
-          echo "LIBIL2CPP=$LIBIL2CPP"
-          echo "METADATA=$METADATA"
-          echo "UNITY_VERSION=${UNITY_VERSION:-UNKNOWN}"
-
-          file "$LIBIL2CPP"
-          ls -lh "$LIBIL2CPP" "$METADATA" "$DATA_DIR/data.unity3d"
-
-          if [ "$UNITY_VERSION" != "2022.3.62f2" ]; then
-            echo "ERROR: Expected Unity 2022.3.62f2, got ${UNITY_VERSION:-UNKNOWN}"
-            exit 1
-          fi
-
-          printf '%s\n' "$DATA_DIR" > output/data-dir.txt
-          printf '%s\n' "$LIBIL2CPP" > output/libil2cpp-path.txt
-          printf '%s\n' "$METADATA" > output/metadata-path.txt
-          printf '%s\n' "$UNITY_VERSION" > output/unity-version.txt
-
-      - name: Build IL2CPP Dumper
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git clone --depth 1 \
-            https://github.com/rodroidmods/Il2cppdumper-cpp.git \
-            tools/il2cppdumper
-
-          cmake \
-            -S tools/il2cppdumper \
-            -B tools/il2cppdumper/build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release
-
-          cmake --build tools/il2cppdumper/build -j 2
-
-          DUMPER="$(
-            find tools/il2cppdumper/build -type f \
-              -name 'il2cppdumper' \
-              -perm -111 \
-              | head -1
-          )"
-
-          if [ -z "$DUMPER" ]; then
-            echo "ERROR: il2cppdumper executable not found."
-            find tools/il2cppdumper/build -maxdepth 3 -type f -print
-            exit 1
-          fi
-
-          echo "$DUMPER" > output/dumper-path.txt
-          "$DUMPER" --help || true
-
-      - name: Dump IL2CPP metadata and DummyDLLs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          DUMPER="$(cat output/dumper-path.txt)"
-          LIBIL2CPP="$(cat output/libil2cpp-path.txt)"
-          METADATA="$(cat output/metadata-path.txt)"
-
-          mkdir -p output/il2cpp-dump
-
-          set +e
-          "$DUMPER" \
-            "$LIBIL2CPP" \
-            "$METADATA" \
-            "$PWD/output/il2cpp-dump" \
-            2>&1 | tee output/il2cpp-dumper.log
-          RC=${PIPESTATUS[0]}
-          set -e
-
-          echo "DUMPER_EXIT_CODE=$RC"
-
-          if [ "$RC" -ne 0 ]; then
-            echo "ERROR: IL2CPP dump failed."
-            exit "$RC"
-          fi
-
-          echo "===== IL2CPP OUTPUT ====="
-          find output/il2cpp-dump -maxdepth 3 -type f -printf '%s %p\n' \
-            | sort -nr \
-            | head -200
-
-          DUMMY_ASSEMBLY="$(
-            find output/il2cpp-dump -type f \
-              -iname 'Assembly-CSharp.dll' \
-              | head -1 || true
-          )"
-
-          if [ -z "$DUMMY_ASSEMBLY" ]; then
-            echo "ERROR: Dummy Assembly-CSharp.dll was not generated."
-            exit 1
-          fi
-
-          echo "DUMMY_ASSEMBLY_CSHARP=$DUMMY_ASSEMBLY"
-          ls -lh "$DUMMY_ASSEMBLY"
-
-          {
-            echo "===== MOBILE CONTROL NAMES ====="
-            grep -RaiE \
-              'CustomizedJoystick|CustomizedUse|CustomizedDrop|Joystick|Touch|Mobile|Button' \
-              output/il2cpp-dump \
-              --include='*.cs' \
-              --include='*.json' \
-              --include='*.txt' \
-              | head -300 || true
-          } > output/mobile-controls.txt
-
-      - name: Download AssetRipper 2.0.0
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          gh api repos/AssetRipper/AssetRipper/releases/tags/2.0.0 \
-            --jq '.assets[].name' \
-            > output/assetripper-assets.txt
-
-          ASSET="$(
-            grep -Ei '^AssetRipper_linux_(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
-              output/assetripper-assets.txt \
-              | head -1 || true
-          )"
-
-          if [ -z "$ASSET" ]; then
-            ASSET="$(
-              grep -Ei 'linux.*(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
-                output/assetripper-assets.txt \
-                | head -1 || true
-            )"
-          fi
-
-          if [ -z "$ASSET" ]; then
-            echo "ERROR: AssetRipper Linux package not found."
-            cat output/assetripper-assets.txt
-            exit 1
-          fi
-
-          gh release download 2.0.0 \
-            -R AssetRipper/AssetRipper \
-            -p "$ASSET" \
-            -D tools
-
-          mkdir -p tools/assetripper
-
-          case "tools/$ASSET" in
-            *.tar.xz) tar -xJf "tools/$ASSET" -C tools/assetripper ;;
-            *.zip) unzip -q "tools/$ASSET" -d tools/assetripper ;;
-            *)
-              echo "ERROR: unsupported AssetRipper archive"
-              exit 1
-              ;;
-          esac
-
-          RIPPER="$(
-            find tools/assetripper -type f \
-              \( -name AssetRipper.GUI.Free -o -name AssetRipper.GUI -o -name AssetRipper \) \
-              | head -1
-          )"
-
-          if [ -z "$RIPPER" ]; then
-            echo "ERROR: AssetRipper executable not found."
-            find tools/assetripper -maxdepth 3 -type f -print
-            exit 1
-          fi
-
-          chmod +x "$RIPPER"
-          echo "$RIPPER" > output/assetripper-path.txt
-
-      - name: Recover Unity assets/project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RIPPER="$(cat output/assetripper-path.txt)"
-          DATA_DIR="$(cat output/data-dir.txt)"
-          EXPORT_DIR="$PWD/recovered/GrannyLegacy"
-          PORT=3333
-
-          mkdir -p "$EXPORT_DIR"
-
-          "$RIPPER" --headless --port "$PORT" \
-            > output/assetripper.log 2>&1 &
-          PID=$!
-
-          cleanup() {
-            kill "$PID" 2>/dev/null || true
-            wait "$PID" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
-          READY=0
-          for i in $(seq 1 90); do
-            if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
-              READY=1
-              break
-            fi
-            sleep 1
-          done
-
-          if [ "$READY" -ne 1 ]; then
-            echo "ERROR: AssetRipper did not start."
-            tail -300 output/assetripper.log || true
-            exit 1
-          fi
-
-          LOAD_CODE="$(
-            curl -sS \
-              -o output/load-response.txt \
-              -w '%{http_code}' \
-              -H 'Content-Type: application/x-www-form-urlencoded' \
-              --data-urlencode "Path=$DATA_DIR" \
-              "http://127.0.0.1:${PORT}/LoadFolder"
-          )"
-
-          echo "LOAD_HTTP=$LOAD_CODE"
-
-          if [ "$LOAD_CODE" != "200" ] && [ "$LOAD_CODE" != "302" ]; then
-            cat output/load-response.txt || true
-            tail -300 output/assetripper.log || true
-            exit 1
-          fi
-
-          EXPORT_CODE="$(
-            curl -sS \
-              -o output/export-response.txt \
-              -w '%{http_code}' \
-              -H 'Content-Type: application/x-www-form-urlencoded' \
-              --data-urlencode "Path=$EXPORT_DIR" \
-              --data-urlencode 'CreateSubfolder=false' \
-              "http://127.0.0.1:${PORT}/Export/UnityProject"
-          )"
-
-          echo "EXPORT_HTTP=$EXPORT_CODE"
-
-          if [ "$EXPORT_CODE" != "200" ] && [ "$EXPORT_CODE" != "302" ]; then
-            cat output/export-response.txt || true
-            tail -300 output/assetripper.log || true
-            exit 1
-          fi
-
-          cleanup
-          trap - EXIT
-
-          PROJECT=""
-          if [ -d "$EXPORT_DIR/ExportedProject/Assets" ]; then
-            PROJECT="$EXPORT_DIR/ExportedProject"
-          elif [ -d "$EXPORT_DIR/Assets" ]; then
-            PROJECT="$EXPORT_DIR"
-          fi
-
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: recovered project not found."
-            find "$EXPORT_DIR" -maxdepth 4 -type d | head -300
+          if [ -z "$PROJECT" ] || [ ! -d "$PROJECT/Assets" ]; then
+            echo "ERROR: Unity project root not found."
+            find recovered-project -maxdepth 5 -print | head -500
             exit 1
           fi
 
           echo "$PROJECT" > output/project-path.txt
 
-          echo "===== RECOVERY COUNTS ====="
-          echo "PROJECT=$PROJECT"
-          echo "SCENES=$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
-          echo "PREFABS=$(find "$PROJECT/Assets" -type f -name '*.prefab' | wc -l)"
-          echo "MATERIALS=$(find "$PROJECT/Assets" -type f -name '*.mat' | wc -l)"
-          echo "TEXTURES=$(find "$PROJECT/Assets" -type f \( -name '*.png' -o -name '*.tga' -o -name '*.jpg' \) | wc -l)"
-          echo "CS_FILES=$(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
+          echo "===== PROJECT ====="
+          cat "$PROJECT/ProjectSettings/ProjectVersion.txt"
+          echo "Scenes: $(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
+          echo "C# files: $(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
+          echo "DLLs: $(find "$PROJECT/Assets" -type f -name '*.dll' | wc -l)"
 
+      - name: Remove Android-only native plugins
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$(cat output/project-path.txt)"
+
+          echo "===== ANDROID PLUGINS BEFORE CLEAN ====="
+          find "$PROJECT/Assets" -type f \
+            \( -name '*.aar' -o -name '*.jar' -o -name '*.so' \) \
+            -print | head -300 || true
+
+          find "$PROJECT/Assets" -type f \
+            \( -name '*.aar' -o -name '*.jar' -o -name '*.so' \) \
+            -delete || true
+
+          # Remove empty Android plugin directories only if they exist.
+          find "$PROJECT/Assets" -type d -empty -delete || true
+
+      - name: Add iOS build probe script
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$(cat output/project-path.txt)"
+
+          mkdir -p "$PROJECT/Assets/Editor"
+
+          cat > "$PROJECT/Assets/Editor/GrannyLegacyIOSBuild.cs" <<'CS'
+          using System;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build.Reporting;
+          using UnityEngine;
+
+          public static class GrannyLegacyIOSBuild
           {
-            echo "Unity version: $(cat output/unity-version.txt)"
-            echo
-            echo "Recovered project: $PROJECT"
-            echo "Scenes: $(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
-            echo "Prefabs: $(find "$PROJECT/Assets" -type f -name '*.prefab' | wc -l)"
-            echo "Materials: $(find "$PROJECT/Assets" -type f -name '*.mat' | wc -l)"
-            echo "C# files exported by AssetRipper: $(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
-            echo
-            echo "IMPORTANT:"
-            echo "This APK uses IL2CPP."
-            echo "DummyDLLs restore type/method metadata, not original executable C# method bodies."
-            echo "A playable iOS build must not be attempted until we verify/recreate the gameplay code."
-          } > output/recovery-report.txt
+              public static void PerformBuild()
+              {
+                  string[] scenes = EditorBuildSettings.scenes
+                      .Where(s => s.enabled && File.Exists(s.path))
+                      .Select(s => s.path)
+                      .ToArray();
 
-          cat output/recovery-report.txt
+                  if (scenes.Length == 0)
+                  {
+                      scenes = AssetDatabase.FindAssets("t:Scene", new[] { "Assets" })
+                          .Select(AssetDatabase.GUIDToAssetPath)
+                          .Where(p => !string.IsNullOrWhiteSpace(p))
+                          .ToArray();
+                  }
 
-      - name: Pack recovered project
+                  if (scenes.Length == 0)
+                      throw new Exception("No Unity scenes found.");
+
+                  Debug.Log("GRANNY LEGACY iOS: scenes=" + scenes.Length);
+                  foreach (string scene in scenes)
+                      Debug.Log("SCENE: " + scene);
+
+                  PlayerSettings.productName = "Granny Legacy";
+                  PlayerSettings.companyName = "GrannyLegacyIOSPort";
+                  PlayerSettings.SetApplicationIdentifier(
+                      BuildTargetGroup.iOS,
+                      "com.grannylegacy.ios.port"
+                  );
+
+                  PlayerSettings.SetScriptingBackend(
+                      BuildTargetGroup.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+                  PlayerSettings.stripEngineCode = false;
+
+                  string location = Path.GetFullPath(
+                      Path.Combine(Application.dataPath, "../../build/iOS/GrannyLegacy-iOS")
+                  );
+
+                  if (Directory.Exists(location))
+                      Directory.Delete(location, true);
+
+                  Directory.CreateDirectory(location);
+
+                  BuildPlayerOptions options = new BuildPlayerOptions
+                  {
+                      scenes = scenes,
+                      locationPathName = location,
+                      target = BuildTarget.iOS,
+                      targetGroup = BuildTargetGroup.iOS,
+                      options = BuildOptions.CleanBuildCache
+                  };
+
+                  BuildReport report = BuildPipeline.BuildPlayer(options);
+
+                  Debug.Log(
+                      "GRANNY LEGACY iOS BUILD RESULT: " +
+                      report.summary.result +
+                      " errors=" + report.summary.totalErrors +
+                      " warnings=" + report.summary.totalWarnings
+                  );
+
+                  if (report.summary.result != BuildResult.Succeeded)
+                      throw new Exception("Unity iOS export failed: " + report.summary.result);
+              }
+          }
+          CS
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Unity Hub for licensing
         shell: bash
         run: |
           set -euo pipefail
 
+          npm install -g @rage-against-the-pixel/unity-cli
+          unity-cli hub-install --json
+          unity-cli hub-version || true
+
+      - name: Activate Unity Personal
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UNITY_EMAIL:-}" ] || [ -z "${UNITY_PASSWORD:-}" ]; then
+            echo "ERROR: UNITY_USERNAME / UNITY_PASSWORD GitHub Secrets are missing."
+            exit 1
+          fi
+
+          unity-cli activate-license \
+            --license personal \
+            --email "$UNITY_EMAIL" \
+            --password "$UNITY_PASSWORD" \
+            --json
+
+          unity-cli license-context || true
+
+      - name: Install official Unity CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export UNITY_CLI_HOME="$PWD/tools/unity-official-cli"
+          export UNITY_CLI_CHANNEL="beta"
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+
+          rm -rf "$UNITY_CLI_HOME"
+          mkdir -p "$UNITY_CLI_HOME"
+
+          curl -fsSL --retry 5 --retry-delay 3 \
+            https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh \
+            -o /tmp/unity-cli-install.sh
+
+          bash /tmp/unity-cli-install.sh
+
+          echo "$UNITY_CLI_HOME/bin" >> "$GITHUB_PATH"
+
+          UNITY="$UNITY_CLI_HOME/bin/unity"
+          test -x "$UNITY"
+          "$UNITY" --version
+
+      - name: Install Unity 2022.3.62f2 + iOS module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNITY="$PWD/tools/unity-official-cli/bin/unity"
+          INSTALL_ROOT="$HOME/UnityEditors"
+          VERSION="2022.3.62f2"
+
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+
+          mkdir -p "$INSTALL_ROOT"
+
+          "$UNITY" --non-interactive --no-banner --no-color \
+            editors install-path --set "$INSTALL_ROOT"
+
+          "$UNITY" --non-interactive --no-banner --no-color \
+            install "$VERSION" \
+            --module ios \
+            --no-child-modules \
+            --yes \
+            --accept-eula \
+            2>&1 | tee output/unity-install.log
+
+          UNITY_BIN="$(
+            find "$INSTALL_ROOT" -type f \
+              -path '*/Unity.app/Contents/MacOS/Unity' \
+              -print \
+              | head -1
+          )"
+
+          if [ -z "$UNITY_BIN" ] || [ ! -x "$UNITY_BIN" ]; then
+            echo "ERROR: Unity executable not found."
+            find "$INSTALL_ROOT" -maxdepth 6 -print | head -500
+            exit 1
+          fi
+
+          echo "$UNITY_BIN" > output/unity-bin.txt
+          echo "UNITY_BIN=$UNITY_BIN"
+
+          UNITY_APP_ROOT="$(dirname "$(dirname "$(dirname "$UNITY_BIN")")")"
+          EDITOR_ROOT="$(dirname "$UNITY_APP_ROOT")"
+
+          IOS_SUPPORT="$EDITOR_ROOT/PlaybackEngines/iOSSupport"
+          if [ ! -d "$IOS_SUPPORT" ]; then
+            IOS_SUPPORT="$UNITY_APP_ROOT/Contents/PlaybackEngines/iOSSupport"
+          fi
+
+          if [ ! -d "$IOS_SUPPORT" ]; then
+            echo "ERROR: iOSSupport is missing."
+            exit 1
+          fi
+
+          echo "IOS_SUPPORT=$IOS_SUPPORT"
+
+      - name: Unity compile + export Xcode
+        id: unity_build
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+
+          UNITY_BIN="$(cat output/unity-bin.txt)"
           PROJECT="$(cat output/project-path.txt)"
 
-          tar \
-            --exclude='Library' \
-            --exclude='Temp' \
-            --exclude='obj' \
-            -czf granny-recovered.tar.gz \
-            -C "$(dirname "$PROJECT")" \
-            "$(basename "$PROJECT")"
+          "$UNITY_BIN" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PROJECT" \
+            -buildTarget iOS \
+            -executeMethod GrannyLegacyIOSBuild.PerformBuild \
+            -logFile - \
+            2>&1 | tee output/unity-build.log
 
-          ls -lh granny-recovered.tar.gz
+          RC=${PIPESTATUS[0]}
+          echo "UNITY_EXIT=$RC"
+          echo "$RC" > output/unity-exit-code.txt
 
-      - name: Upload recovered Unity project
+          exit "$RC"
+
+      - name: Extract important Unity errors
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          echo "===== COMPILER / BUILD ERRORS =====" | tee output/error-summary.txt
+
+          grep -E \
+            'error CS[0-9]+|Scripts have compiler errors|NullReferenceException|MissingMethodException|DllNotFoundException|BuildFailedException|Exception:|FAILURE|error:' \
+            output/unity-build.log \
+            | tail -400 \
+            | tee -a output/error-summary.txt || true
+
+          echo "===== END ERROR SUMMARY =====" | tee -a output/error-summary.txt
+
+      - name: Locate exported Xcode project
+        id: locate_xcode
+        if: steps.unity_build.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          XCODE_DIR="$PWD/build/iOS/GrannyLegacy-iOS"
+
+          if [ ! -d "$XCODE_DIR" ]; then
+            XCODE_DIR="$(
+              find "$PWD/build" -type d -name '*.xcodeproj' -print 2>/dev/null \
+                | head -1 \
+                | xargs -r dirname
+            )"
+          fi
+
+          if [ -z "$XCODE_DIR" ] || [ ! -d "$XCODE_DIR" ]; then
+            echo "ERROR: Xcode output not found."
+            exit 1
+          fi
+
+          PROJ="$(find "$XCODE_DIR" -maxdepth 2 -type d -name '*.xcodeproj' | head -1)"
+          WORKSPACE="$(find "$XCODE_DIR" -maxdepth 2 -type d -name '*.xcworkspace' | head -1 || true)"
+
+          echo "$XCODE_DIR" > output/xcode-dir.txt
+          echo "$PROJ" > output/xcode-project.txt
+          echo "$WORKSPACE" > output/xcode-workspace.txt
+
+          echo "XCODE_DIR=$XCODE_DIR"
+          echo "PROJ=$PROJ"
+          echo "WORKSPACE=${WORKSPACE:-NONE}"
+
+          xcodebuild -project "$PROJ" -list
+
+      - name: Build unsigned iOS app
+        id: xcode_build
+        if: steps.unity_build.outcome == 'success'
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+
+          PROJ="$(cat output/xcode-project.txt)"
+          WORKSPACE="$(cat output/xcode-workspace.txt)"
+
+          rm -rf DerivedData
+          mkdir -p DerivedData
+
+          COMMON_ARGS=(
+            -scheme Unity-iPhone
+            -configuration Release
+            -sdk iphoneos
+            -destination 'generic/platform=iOS'
+            -derivedDataPath "$PWD/DerivedData"
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=
+            DEVELOPMENT_TEAM=
+            ONLY_ACTIVE_ARCH=YES
+            ARCHS=arm64
+          )
+
+          if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
+            xcodebuild \
+              -workspace "$WORKSPACE" \
+              "${COMMON_ARGS[@]}" \
+              build \
+              2>&1 | tee output/xcodebuild.log
+          else
+            xcodebuild \
+              -project "$PROJ" \
+              "${COMMON_ARGS[@]}" \
+              build \
+              2>&1 | tee output/xcodebuild.log
+          fi
+
+          RC=${PIPESTATUS[0]}
+          echo "XCODE_EXIT=$RC"
+          echo "$RC" > output/xcode-exit-code.txt
+          exit "$RC"
+
+      - name: Package unsigned IPA
+        if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(
+            find "$PWD/DerivedData/Build/Products" \
+              -type d -name '*.app' \
+              -path '*Release-iphoneos*' \
+              | head -1
+          )"
+
+          if [ -z "$APP" ]; then
+            echo "ERROR: built .app not found."
+            exit 1
+          fi
+
+          echo "APP=$APP"
+
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+
+          /usr/bin/zip -qry Granny-Legacy-iOS-v2-UNSIGNED.ipa Payload
+
+          echo "===== IPA ====="
+          ls -lh Granny-Legacy-iOS-v2-UNSIGNED.ipa
+
+          APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          echo "APP_BUNDLE_ID=$APP_ID" | tee output/bundle-id.txt
+
+          FRAMEWORK_PLIST="$APP/Frameworks/UnityFramework.framework/Info.plist"
+          if [ -f "$FRAMEWORK_PLIST" ]; then
+            FRAMEWORK_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$FRAMEWORK_PLIST")"
+            echo "UNITYFRAMEWORK_BUNDLE_ID=$FRAMEWORK_ID" | tee -a output/bundle-id.txt
+          fi
+
+      - name: Upload first unsigned IPA
+        if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-Recovered-Unity-v1
-          path: granny-recovered.tar.gz
+          name: Granny-Legacy-iOS-v2-UNSIGNED
+          path: Granny-Legacy-iOS-v2-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload IL2CPP dump
+      - name: Upload Xcode project
+        if: steps.unity_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-IL2CPP-Dump-v1
-          path: |
-            output/il2cpp-dump
-            output/il2cpp-dumper.log
-            output/mobile-controls.txt
-            output/recovery-report.txt
+          name: Granny-Legacy-iOS-v2-Xcode
+          path: build/iOS/GrannyLegacy-iOS
           if-no-files-found: warn
           compression-level: 6
 
-      - name: Upload recovery diagnostics
+      - name: Upload v2 diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-Recovery-Diagnostics-v1
+          name: Granny-Legacy-iOS-v2-Diagnostics
           path: |
             output
           if-no-files-found: warn
           compression-level: 6
+
+      - name: Final status
+        if: always()
+        shell: bash
+        run: |
+          echo "Unity outcome: ${{ steps.unity_build.outcome }}"
+          echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
+
+          if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
+            echo "V2 RESULT: Unity recovered project does not compile/export yet."
+            echo "Download Granny-Legacy-iOS-v2-Diagnostics and inspect error-summary.txt."
+            exit 1
+          fi
+
+          if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
+            echo "V2 RESULT: Unity exported Xcode, but Xcode build failed."
+            echo "Download Granny-Legacy-iOS-v2-Diagnostics."
+            exit 1
+          fi
+
+          echo "V2 RESULT: FIRST UNSIGNED IPA CREATED."
+
+      - name: Return Unity license
+        if: always()
+        shell: bash
+        run: |
+          if command -v unity-cli >/dev/null 2>&1; then
+            unity-cli return-license --license personal || true
+          fi
