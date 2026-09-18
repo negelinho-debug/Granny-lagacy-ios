@@ -1,4 +1,4 @@
-name: Granny Legacy iOS - v3 XCODE PATH FIX
+name: Granny Legacy iOS - v4 LOGIC RECOVERY + ORIGINAL ICON
 
 on:
   workflow_dispatch:
@@ -8,123 +8,574 @@ permissions:
   actions: read
 
 jobs:
-  build_ios:
-    name: Download recovered project + try first iOS IPA
-    runs-on: macos-latest
+  recover_logic:
+    name: Recover IL2CPP gameplay logic
+    runs-on: ubuntu-latest
     timeout-minutes: 150
 
     env:
       GH_TOKEN: ${{ github.token }}
-      UNITY_EMAIL: ${{ secrets.UNITY_USERNAME }}
-      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Find latest successful v1 run
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Install recovery dependencies
         shell: bash
         run: |
           set -euo pipefail
 
-          RUN_ID="$(
-            gh run list \
-              --workflow granny-legacy-ios.yml \
-              --status success \
-              --limit 20 \
-              --json databaseId,name,displayTitle,createdAt \
-              --jq '.[0].databaseId'
-          )"
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            jq \
+            unzip \
+            zip \
+            xz-utils \
+            binutils \
+            file \
+            python3
 
-          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-            echo "ERROR: Could not find a successful previous run."
+          rm -rf work tools recovered output recovered-project.tar.gz
+          mkdir -p work tools recovered output
+
+      - name: Download Granny Legacy APK from newest GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "ERROR: No GitHub Release exists."
             exit 1
           fi
 
-          echo "SOURCE_RUN_ID=$RUN_ID"
-          echo "$RUN_ID" > source-run-id.txt
+          mkdir -p work/release
 
-      - name: Download recovered Unity project from v1
+          gh release download "$TAG" \
+            --dir work/release \
+            --pattern "*.apk"
+
+          APK="$(
+            find work/release -type f -iname '*.apk' -printf '%s %p\n' \
+              | sort -nr \
+              | head -1 \
+              | cut -d' ' -f2-
+          )"
+
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "ERROR: APK not found in newest Release."
+            exit 1
+          fi
+
+          cp "$APK" work/GrannyLegacy.apk
+          echo "APK=$PWD/work/GrannyLegacy.apk" | tee output/apk-path.txt
+
+          ls -lh work/GrannyLegacy.apk
+          sha256sum work/GrannyLegacy.apk | tee output/apk-sha256.txt
+
+      - name: Extract APK + save original app icon
         shell: bash
         run: |
           set -euo pipefail
 
-          RUN_ID="$(cat source-run-id.txt)"
+          mkdir -p work/android
+          unzip -q work/GrannyLegacy.apk -d work/android
 
-          rm -rf recovered-download il2cpp-download recovered-project build output DerivedData
-          mkdir -p recovered-download il2cpp-download recovered-project build output
+          DATA_DIR="$PWD/work/android/assets/bin/Data"
+          test -d "$DATA_DIR"
 
-          gh run download "$RUN_ID" \
-            -n "Granny-Legacy-Recovered-Unity-v1" \
-            -D recovered-download
+          echo "$DATA_DIR" > output/data-dir.txt
 
-          # IL2CPP dump is downloaded too for diagnostics.
-          gh run download "$RUN_ID" \
-            -n "Granny-Legacy-IL2CPP-Dump-v1" \
-            -D il2cpp-download || true
+          ICON="$PWD/work/android/res/oj.png"
 
-          echo "===== RECOVERED ARTIFACT ====="
-          find recovered-download -maxdepth 3 -type f -print
+          if [ ! -f "$ICON" ]; then
+            ICON="$(
+              python3 - <<'PY'
+          from pathlib import Path
+          try:
+              from PIL import Image
+          except Exception:
+              print("")
+              raise SystemExit
 
-          ARCHIVE="$(
-            find recovered-download -type f \
-              \( -name '*.tar.gz' -o -name '*.tgz' \) \
+          best = None
+          root = Path("work/android/res")
+          for p in root.rglob("*.png"):
+              try:
+                  with Image.open(p) as im:
+                      w, h = im.size
+                  if w == h:
+                      score = w * h
+                      if best is None or score > best[0]:
+                          best = (score, p)
+              except Exception:
+                  pass
+
+          print(best[1] if best else "")
+          PY
+            )"
+          fi
+
+          if [ -z "${ICON:-}" ] || [ ! -f "$ICON" ]; then
+            echo "ERROR: Original Granny Legacy icon not found."
+            exit 1
+          fi
+
+          cp "$ICON" output/GrannyLegacy-AppIcon.png
+
+          echo "ORIGINAL_ICON=$ICON"
+          file output/GrannyLegacy-AppIcon.png
+          ls -lh output/GrannyLegacy-AppIcon.png
+
+      - name: Download latest Cpp2IL Linux x64
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p tools/cpp2il-download tools/cpp2il
+
+          RELEASES="$(gh api repos/SamboyCoding/Cpp2IL/releases --paginate)"
+
+          TAG="$(
+            printf '%s' "$RELEASES" \
+              | jq -r '
+                  [
+                    .[]
+                    | select(.draft == false)
+                    | select(any(.assets[]?;
+                        (.name | test("Linux"; "i"))
+                        and ((.name | test("ARM64|aarch64"; "i")) | not)
+                      ))
+                  ][0].tag_name
+                '
+          )"
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "ERROR: Could not find a Cpp2IL Linux x64 release."
+            exit 1
+          fi
+
+          echo "CPP2IL_TAG=$TAG"
+
+          gh release download "$TAG" \
+            -R SamboyCoding/Cpp2IL \
+            -D tools/cpp2il-download \
+            -p '*Linux*'
+
+          echo "===== DOWNLOADED CPP2IL FILES ====="
+          find tools/cpp2il-download -maxdepth 2 -type f -print
+
+          ZIP="$(
+            find tools/cpp2il-download -maxdepth 1 -type f \
+              -iname '*Linux*.zip' \
+              ! -iname '*ARM64*' \
+              ! -iname '*aarch64*' \
+              | head -1 || true
+          )"
+
+          if [ -n "$ZIP" ]; then
+            unzip -q "$ZIP" -d tools/cpp2il
+          else
+            BIN="$(
+              find tools/cpp2il-download -maxdepth 1 -type f \
+                -iname '*Linux*' \
+                ! -iname '*.zip' \
+                ! -iname '*ARM64*' \
+                ! -iname '*aarch64*' \
+                | head -1 || true
+            )"
+
+            if [ -z "$BIN" ]; then
+              echo "ERROR: Cpp2IL Linux x64 binary not found."
+              exit 1
+            fi
+
+            cp "$BIN" tools/cpp2il/Cpp2IL
+          fi
+
+          CPP2IL="$(
+            find tools/cpp2il -type f \
+              \( -name 'Cpp2IL' -o -iname 'cpp2il' -o -iname 'Cpp2IL-*Linux*' \) \
+              | head -1 || true
+          )"
+
+          if [ -z "$CPP2IL" ]; then
+            CPP2IL="$(
+              find tools/cpp2il -type f -maxdepth 4 \
+                | while read -r f; do
+                    if file "$f" | grep -qi 'executable'; then
+                      echo "$f"
+                      break
+                    fi
+                  done
+            )"
+          fi
+
+          if [ -z "$CPP2IL" ] || [ ! -f "$CPP2IL" ]; then
+            echo "ERROR: Cpp2IL executable not located."
+            exit 1
+          fi
+
+          chmod +x "$CPP2IL"
+          echo "$CPP2IL" > output/cpp2il-path.txt
+
+          "$CPP2IL" --version || true
+          "$CPP2IL" --list-output-formats | tee output/cpp2il-output-formats.txt || true
+
+      - name: Recover executable IL from Android IL2CPP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CPP2IL="$(cat output/cpp2il-path.txt)"
+          APK="$PWD/work/GrannyLegacy.apk"
+
+          rm -rf output/cpp2il-recovered
+          mkdir -p output/cpp2il-recovered
+
+          set +e
+          "$CPP2IL" \
+            --game-path "$APK" \
+            --output-as dll_il_recovery \
+            --output-to "$PWD/output/cpp2il-recovered" \
+            --verbose \
+            2>&1 | tee output/cpp2il-recovery.log
+          RC=${PIPESTATUS[0]}
+          set -e
+
+          echo "CPP2IL_EXIT=$RC"
+
+          if [ "$RC" -ne 0 ]; then
+            echo "ERROR: Cpp2IL IL recovery failed."
+            exit "$RC"
+          fi
+
+          echo "===== CPP2IL OUTPUT ====="
+          find output/cpp2il-recovered -type f -printf '%s %p\n' \
+            | sort -nr \
+            | head -200
+
+          ASSEMBLY="$(
+            find output/cpp2il-recovered -type f \
+              -iname 'Assembly-CSharp.dll' \
+              | head -1 || true
+          )"
+
+          if [ -z "$ASSEMBLY" ]; then
+            echo "ERROR: Cpp2IL did not produce Assembly-CSharp.dll."
+            exit 1
+          fi
+
+          echo "$ASSEMBLY" > output/recovered-assembly-csharp.txt
+          ls -lh "$ASSEMBLY"
+
+          grep -Ei \
+            'analysis success rate|methods.*recovered|failed|warning|error' \
+            output/cpp2il-recovery.log \
+            | tail -200 \
+            > output/cpp2il-summary.txt || true
+
+      - name: Install ILSpy command line
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet tool install --global ilspycmd || \
+          dotnet tool update --global ilspycmd
+
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          "$HOME/.dotnet/tools/ilspycmd" --version
+
+      - name: Decompile recovered gameplay assemblies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ILSPY="$HOME/.dotnet/tools/ilspycmd"
+          ROOT="$PWD/output/cpp2il-recovered"
+          DEST="$PWD/output/decompiled"
+
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+
+          COUNT=0
+
+          while IFS= read -r DLL; do
+            BASE="$(basename "$DLL")"
+
+            case "$BASE" in
+              Unity*.dll|System*.dll|mscorlib.dll|netstandard.dll|Il2CppDummyDll.dll)
+                continue
+                ;;
+            esac
+
+            NAME="${BASE%.dll}"
+            OUT="$DEST/$NAME"
+            mkdir -p "$OUT"
+
+            echo "DECOMPILE: $BASE"
+
+            if "$ILSPY" -p -o "$OUT" "$DLL" \
+              >> output/ilspy.log 2>&1; then
+              COUNT=$((COUNT + 1))
+            else
+              echo "WARNING: ILSpy failed for $BASE" | tee -a output/ilspy-failures.txt
+            fi
+          done < <(find "$ROOT" -type f -name '*.dll' | sort)
+
+          echo "DECOMPILED_ASSEMBLIES=$COUNT"
+          echo "$COUNT" > output/decompiled-assembly-count.txt
+
+          if [ "$COUNT" -lt 1 ]; then
+            echo "ERROR: No gameplay assembly could be decompiled."
+            exit 1
+          fi
+
+          find "$DEST" -type f -name '*.cs' | head -200 > output/decompiled-files-sample.txt
+
+      - name: Download AssetRipper 2.0.0
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api repos/AssetRipper/AssetRipper/releases/tags/2.0.0 \
+            --jq '.assets[].name' \
+            > output/assetripper-assets.txt
+
+          ASSET="$(
+            grep -Ei '^AssetRipper_linux_(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
+              output/assetripper-assets.txt \
+              | head -1 || true
+          )"
+
+          if [ -z "$ASSET" ]; then
+            ASSET="$(
+              grep -Ei 'linux.*(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
+                output/assetripper-assets.txt \
+                | head -1 || true
+            )"
+          fi
+
+          if [ -z "$ASSET" ]; then
+            echo "ERROR: AssetRipper Linux package not found."
+            exit 1
+          fi
+
+          gh release download 2.0.0 \
+            -R AssetRipper/AssetRipper \
+            -p "$ASSET" \
+            -D tools
+
+          mkdir -p tools/assetripper
+
+          case "tools/$ASSET" in
+            *.tar.xz) tar -xJf "tools/$ASSET" -C tools/assetripper ;;
+            *.zip) unzip -q "tools/$ASSET" -d tools/assetripper ;;
+            *) exit 1 ;;
+          esac
+
+          RIPPER="$(
+            find tools/assetripper -type f \
+              \( -name AssetRipper.GUI.Free -o -name AssetRipper.GUI -o -name AssetRipper \) \
               | head -1
           )"
 
-          if [ -z "$ARCHIVE" ]; then
-            echo "ERROR: recovered project archive not found."
+          if [ -z "$RIPPER" ]; then
+            echo "ERROR: AssetRipper executable not found."
             exit 1
           fi
 
-          tar -xzf "$ARCHIVE" -C recovered-project
+          chmod +x "$RIPPER"
+          echo "$RIPPER" > output/assetripper-path.txt
 
-          PROJECT="$(
-            find recovered-project -type f \
-              -path '*/ProjectSettings/ProjectVersion.txt' \
-              -print \
-              | head -1 \
-              | xargs -I{} dirname {} \
-              | xargs -I{} dirname {}
-          )"
+      - name: Recover Unity project from APK assets
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if [ -z "$PROJECT" ] || [ ! -d "$PROJECT/Assets" ]; then
-            echo "ERROR: Unity project root not found."
-            find recovered-project -maxdepth 5 -print | head -500
+          RIPPER="$(cat output/assetripper-path.txt)"
+          DATA_DIR="$(cat output/data-dir.txt)"
+          EXPORT_DIR="$PWD/recovered/GrannyLegacy"
+          PORT=3333
+
+          mkdir -p "$EXPORT_DIR"
+
+          "$RIPPER" --headless --port "$PORT" \
+            > output/assetripper.log 2>&1 &
+          PID=$!
+
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          READY=0
+          for i in $(seq 1 90); do
+            if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            tail -300 output/assetripper.log || true
+            exit 1
+          fi
+
+          curl -fsS \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "Path=$DATA_DIR" \
+            "http://127.0.0.1:${PORT}/LoadFolder" \
+            -o output/load-response.txt
+
+          curl -fsS \
+            -H 'Content-Type: application/x-www-form-urlencoded' \
+            --data-urlencode "Path=$EXPORT_DIR" \
+            --data-urlencode 'CreateSubfolder=false' \
+            "http://127.0.0.1:${PORT}/Export/UnityProject" \
+            -o output/export-response.txt
+
+          cleanup
+          trap - EXIT
+
+          PROJECT=""
+          if [ -d "$EXPORT_DIR/ExportedProject/Assets" ]; then
+            PROJECT="$EXPORT_DIR/ExportedProject"
+          elif [ -d "$EXPORT_DIR/Assets" ]; then
+            PROJECT="$EXPORT_DIR"
+          fi
+
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: AssetRipper project not found."
             exit 1
           fi
 
           echo "$PROJECT" > output/project-path.txt
 
-          echo "===== PROJECT ====="
-          cat "$PROJECT/ProjectSettings/ProjectVersion.txt"
-          echo "Scenes: $(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
-          echo "C# files: $(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
-          echo "DLLs: $(find "$PROJECT/Assets" -type f -name '*.dll' | wc -l)"
+          echo "SCENES=$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
+          echo "CS_FILES=$(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
 
-      - name: Remove Android-only native plugins
+      - name: Merge recovered method bodies into AssetRipper scripts
         shell: bash
         run: |
           set -euo pipefail
+
+          PROJECT="$(cat output/project-path.txt)"
+          export PROJECT
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from collections import defaultdict
+
+          project = Path(os.environ["PROJECT"])
+          assets = project / "Assets"
+          decomp = Path("output/decompiled")
+
+          targets = defaultdict(list)
+          for p in assets.rglob("*.cs"):
+              targets[p.stem.lower()].append(p)
+
+          patched = []
+          skipped_ambiguous = []
+          missing = []
+
+          for src in decomp.rglob("*.cs"):
+              key = src.stem.lower()
+              matches = targets.get(key, [])
+
+              if len(matches) == 1:
+                  dst = matches[0]
+                  try:
+                      content = src.read_text(encoding="utf-8-sig", errors="replace")
+
+                      # Strip decompiler/compiler generated project-level noise that should not
+                      # replace Unity scripts. Keep normal class files only.
+                      if "namespace Properties" in content and "AssemblyInfo" in src.name:
+                          continue
+
+                      dst.write_text(content, encoding="utf-8")
+                      patched.append((src, dst))
+                  except Exception as e:
+                      print("PATCH_FAIL", src, e)
+              elif len(matches) > 1:
+                  skipped_ambiguous.append((src, matches))
+              else:
+                  missing.append(src)
+
+          Path("output/patched-scripts.txt").write_text(
+              "\n".join(f"{s} -> {d}" for s, d in patched),
+              encoding="utf-8"
+          )
+
+          Path("output/logic-merge-summary.txt").write_text(
+              f"patched={len(patched)}\n"
+              f"ambiguous={len(skipped_ambiguous)}\n"
+              f"unmatched={len(missing)}\n",
+              encoding="utf-8"
+          )
+
+          important = {
+              "enemycontroller",
+              "playerstatus",
+              "inventory",
+              "seedmanager",
+              "pickray",
+              "mobilefps",
+              "beartraplogic",
+              "grannyrobot",
+          }
+
+          patched_names = {d.stem.lower() for _, d in patched}
+          important_patched = sorted(important & patched_names)
+
+          Path("output/important-logic.txt").write_text(
+              "\n".join(important_patched),
+              encoding="utf-8"
+          )
+
+          print("PATCHED", len(patched))
+          print("IMPORTANT_PATCHED", important_patched)
+
+          # Do not waste another IPA build if essentially no gameplay code was merged.
+          if len(patched) < 20:
+              raise SystemExit("Too few recovered scripts were merged; refusing to build another asset-only IPA.")
+
+          if len(important_patched) < 3:
+              raise SystemExit("Core gameplay scripts were not recovered well enough; refusing to build broken IPA.")
+          PY
+
+          cat output/logic-merge-summary.txt
+          cat output/important-logic.txt
+
+      - name: Add original icon + iOS build script
+        shell: bash
+        run: |
+          set -euo pipefail
+
           PROJECT="$(cat output/project-path.txt)"
 
-          echo "===== ANDROID PLUGINS BEFORE CLEAN ====="
-          find "$PROJECT/Assets" -type f \
-            \( -name '*.aar' -o -name '*.jar' -o -name '*.so' \) \
-            -print | head -300 || true
+          cp output/GrannyLegacy-AppIcon.png \
+            "$PROJECT/Assets/GrannyLegacyAppIcon.png"
 
           find "$PROJECT/Assets" -type f \
             \( -name '*.aar' -o -name '*.jar' -o -name '*.so' \) \
             -delete || true
-
-          # Remove empty Android plugin directories only if they exist.
-          find "$PROJECT/Assets" -type d -empty -delete || true
-
-      - name: Add iOS build probe script
-        shell: bash
-        run: |
-          set -euo pipefail
-          PROJECT="$(cat output/project-path.txt)"
 
           mkdir -p "$PROJECT/Assets/Editor"
 
@@ -138,8 +589,40 @@ jobs:
 
           public static class GrannyLegacyIOSBuild
           {
+              private static void ConfigureOriginalIcon()
+              {
+                  const string iconPath = "Assets/GrannyLegacyAppIcon.png";
+
+                  AssetDatabase.ImportAsset(iconPath, ImportAssetOptions.ForceUpdate);
+
+                  Texture2D icon = AssetDatabase.LoadAssetAtPath<Texture2D>(iconPath);
+                  if (icon == null)
+                      throw new Exception("Original Granny Legacy icon failed to import.");
+
+                  int[] sizes = PlayerSettings.GetIconSizesForTargetGroup(BuildTargetGroup.iOS);
+                  if (sizes == null || sizes.Length == 0)
+                  {
+                      PlayerSettings.SetIconsForTargetGroup(
+                          BuildTargetGroup.iOS,
+                          new[] { icon }
+                      );
+                  }
+                  else
+                  {
+                      Texture2D[] icons = Enumerable.Repeat(icon, sizes.Length).ToArray();
+                      PlayerSettings.SetIconsForTargetGroup(
+                          BuildTargetGroup.iOS,
+                          icons
+                      );
+                  }
+
+                  Debug.Log("GRANNY LEGACY: original Android icon configured for iOS.");
+              }
+
               public static void PerformBuild()
               {
+                  ConfigureOriginalIcon();
+
                   string[] scenes = EditorBuildSettings.scenes
                       .Where(s => s.enabled && File.Exists(s.path))
                       .Select(s => s.path)
@@ -154,14 +637,11 @@ jobs:
                   }
 
                   if (scenes.Length == 0)
-                      throw new Exception("No Unity scenes found.");
-
-                  Debug.Log("GRANNY LEGACY iOS: scenes=" + scenes.Length);
-                  foreach (string scene in scenes)
-                      Debug.Log("SCENE: " + scene);
+                      throw new Exception("No scenes found.");
 
                   PlayerSettings.productName = "Granny Legacy";
                   PlayerSettings.companyName = "GrannyLegacyIOSPort";
+
                   PlayerSettings.SetApplicationIdentifier(
                       BuildTargetGroup.iOS,
                       "com.grannylegacy.ios.port"
@@ -184,20 +664,19 @@ jobs:
 
                   Directory.CreateDirectory(location);
 
-                  BuildPlayerOptions options = new BuildPlayerOptions
-                  {
-                      scenes = scenes,
-                      locationPathName = location,
-                      target = BuildTarget.iOS,
-                      targetGroup = BuildTargetGroup.iOS,
-                      options = BuildOptions.CleanBuildCache
-                  };
-
-                  BuildReport report = BuildPipeline.BuildPlayer(options);
+                  BuildReport report = BuildPipeline.BuildPlayer(
+                      new BuildPlayerOptions
+                      {
+                          scenes = scenes,
+                          locationPathName = location,
+                          target = BuildTarget.iOS,
+                          targetGroup = BuildTargetGroup.iOS,
+                          options = BuildOptions.CleanBuildCache
+                      }
+                  );
 
                   Debug.Log(
-                      "GRANNY LEGACY iOS BUILD RESULT: " +
-                      report.summary.result +
+                      "GRANNY LEGACY v4 BUILD RESULT=" + report.summary.result +
                       " errors=" + report.summary.totalErrors +
                       " warnings=" + report.summary.totalWarnings
                   );
@@ -208,6 +687,109 @@ jobs:
           }
           CS
 
+      - name: Pack recovered project with restored logic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(cat output/project-path.txt)"
+
+          tar \
+            --exclude='Library' \
+            --exclude='Temp' \
+            --exclude='obj' \
+            -czf recovered-project.tar.gz \
+            -C "$(dirname "$PROJECT")" \
+            "$(basename "$PROJECT")"
+
+          ls -lh recovered-project.tar.gz
+
+      - name: Upload logic-recovered Unity project
+        uses: actions/upload-artifact@v4
+        with:
+          name: Granny-Legacy-v4-Recovered-Logic-Project
+          path: recovered-project.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Granny-Legacy-v4-Logic-Diagnostics
+          path: |
+            output/cpp2il-recovery.log
+            output/cpp2il-summary.txt
+            output/logic-merge-summary.txt
+            output/important-logic.txt
+            output/patched-scripts.txt
+            output/ilspy.log
+            output/ilspy-failures.txt
+            output/assetripper.log
+          if-no-files-found: warn
+          compression-level: 6
+
+  build_ios:
+    name: Build Granny Legacy v4 iOS IPA
+    needs: recover_logic
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UNITY_EMAIL: ${{ secrets.UNITY_USERNAME }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download recovered v4 project
+        uses: actions/download-artifact@v4
+        with:
+          name: Granny-Legacy-v4-Recovered-Logic-Project
+          path: recovered-download
+
+      - name: Extract recovered project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p recovered-project output build
+
+          ARCHIVE="$(
+            find recovered-download -type f -name '*.tar.gz' | head -1
+          )"
+
+          test -f "$ARCHIVE"
+
+          tar -xzf "$ARCHIVE" -C recovered-project
+
+          PROJECT="$(
+            find recovered-project -type f \
+              -path '*/ProjectSettings/ProjectVersion.txt' \
+              -print \
+              | head -1 \
+              | xargs -I{} dirname {} \
+              | xargs -I{} dirname {}
+          )"
+
+          if [ -z "$PROJECT" ] || [ ! -d "$PROJECT/Assets" ]; then
+            echo "ERROR: Unity project root not found."
+            exit 1
+          fi
+
+          echo "$PROJECT" > output/project-path.txt
+
+          cat "$PROJECT/ProjectSettings/ProjectVersion.txt"
+
+          if [ -f "$PROJECT/Assets/GrannyLegacyAppIcon.png" ]; then
+            sips -z 1024 1024 \
+              "$PROJECT/Assets/GrannyLegacyAppIcon.png" \
+              --out "$PROJECT/Assets/GrannyLegacyAppIcon.png" \
+              >/dev/null
+          fi
+
       - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
@@ -217,7 +799,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           npm install -g @rage-against-the-pixel/unity-cli
           unity-cli hub-install --json
           unity-cli hub-version || true
@@ -226,11 +807,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          if [ -z "${UNITY_EMAIL:-}" ] || [ -z "${UNITY_PASSWORD:-}" ]; then
-            echo "ERROR: UNITY_USERNAME / UNITY_PASSWORD GitHub Secrets are missing."
-            exit 1
-          fi
 
           unity-cli activate-license \
             --license personal \
@@ -299,29 +875,8 @@ jobs:
               | head -1
           )"
 
-          if [ -z "$UNITY_BIN" ] || [ ! -x "$UNITY_BIN" ]; then
-            echo "ERROR: Unity executable not found."
-            find "$INSTALL_ROOT" -maxdepth 6 -print | head -500
-            exit 1
-          fi
-
+          test -x "$UNITY_BIN"
           echo "$UNITY_BIN" > output/unity-bin.txt
-          echo "UNITY_BIN=$UNITY_BIN"
-
-          UNITY_APP_ROOT="$(dirname "$(dirname "$(dirname "$UNITY_BIN")")")"
-          EDITOR_ROOT="$(dirname "$UNITY_APP_ROOT")"
-
-          IOS_SUPPORT="$EDITOR_ROOT/PlaybackEngines/iOSSupport"
-          if [ ! -d "$IOS_SUPPORT" ]; then
-            IOS_SUPPORT="$UNITY_APP_ROOT/Contents/PlaybackEngines/iOSSupport"
-          fi
-
-          if [ ! -d "$IOS_SUPPORT" ]; then
-            echo "ERROR: iOSSupport is missing."
-            exit 1
-          fi
-
-          echo "IOS_SUPPORT=$IOS_SUPPORT"
 
       - name: Unity compile + export Xcode
         id: unity_build
@@ -344,26 +899,22 @@ jobs:
             2>&1 | tee output/unity-build.log
 
           RC=${PIPESTATUS[0]}
-          echo "UNITY_EXIT=$RC"
           echo "$RC" > output/unity-exit-code.txt
-
           exit "$RC"
 
-      - name: Extract important Unity errors
+      - name: Extract Unity errors
         if: always()
         shell: bash
         run: |
           set +e
 
-          echo "===== COMPILER / BUILD ERRORS =====" | tee output/error-summary.txt
-
           grep -E \
-            'error CS[0-9]+|Scripts have compiler errors|NullReferenceException|MissingMethodException|DllNotFoundException|BuildFailedException|Exception:|FAILURE|error:' \
+            'error CS[0-9]+|Scripts have compiler errors|NullReferenceException|MissingMethodException|BuildFailedException|Exception:|error:' \
             output/unity-build.log \
-            | tail -400 \
-            | tee -a output/error-summary.txt || true
+            | tail -500 \
+            > output/error-summary.txt || true
 
-          echo "===== END ERROR SUMMARY =====" | tee -a output/error-summary.txt
+          cat output/error-summary.txt || true
 
       - name: Locate exported Xcode project
         id: locate_xcode
@@ -371,8 +922,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "===== SEARCHING FOR UNITY XCODE EXPORT ====="
 
           PROJ="$(
             find "$PWD" -type d -name 'Unity-iPhone.xcodeproj' -print 2>/dev/null \
@@ -388,11 +937,7 @@ jobs:
           fi
 
           if [ -z "$PROJ" ] || [ ! -d "$PROJ" ]; then
-            echo "ERROR: Xcode output not found anywhere under workspace."
-            echo "===== POSSIBLE BUILD OUTPUT DIRECTORIES ====="
-            find "$PWD" -maxdepth 10 -type d \
-              \( -iname '*ios*' -o -iname '*build*' -o -iname '*.xcodeproj' \) \
-              -print | head -500 || true
+            echo "ERROR: Xcode project not found."
             exit 1
           fi
 
@@ -403,14 +948,6 @@ jobs:
           echo "$PROJ" > output/xcode-project.txt
           echo "$WORKSPACE" > output/xcode-workspace.txt
 
-          echo "XCODE_DIR=$XCODE_DIR"
-          echo "PROJ=$PROJ"
-          echo "WORKSPACE=${WORKSPACE:-NONE}"
-
-          rm -rf xcode-output
-          mkdir -p xcode-output
-          ditto "$XCODE_DIR" xcode-output/GrannyLegacy-iOS
-
           if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
             xcodebuild -workspace "$WORKSPACE" -list
           else
@@ -419,7 +956,7 @@ jobs:
 
       - name: Build unsigned iOS app
         id: xcode_build
-        if: steps.unity_build.outcome == 'success'
+        if: steps.unity_build.outcome == 'success' && steps.locate_xcode.outcome == 'success'
         shell: bash
         continue-on-error: true
         run: |
@@ -460,11 +997,10 @@ jobs:
           fi
 
           RC=${PIPESTATUS[0]}
-          echo "XCODE_EXIT=$RC"
           echo "$RC" > output/xcode-exit-code.txt
           exit "$RC"
 
-      - name: Package unsigned IPA
+      - name: Package unsigned v4 IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         shell: bash
         run: |
@@ -482,49 +1018,33 @@ jobs:
             exit 1
           fi
 
-          echo "APP=$APP"
-
           rm -rf Payload
-          mkdir -p Payload
+          mkdir Payload
           cp -R "$APP" Payload/
 
-          /usr/bin/zip -qry Granny-Legacy-iOS-v3-UNSIGNED.ipa Payload
+          /usr/bin/zip -qry Granny-Legacy-iOS-v4-UNSIGNED.ipa Payload
 
-          echo "===== IPA ====="
-          ls -lh Granny-Legacy-iOS-v3-UNSIGNED.ipa
+          ls -lh Granny-Legacy-iOS-v4-UNSIGNED.ipa
 
-          APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
-          echo "APP_BUNDLE_ID=$APP_ID" | tee output/bundle-id.txt
+          /usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleIdentifier' \
+            "$APP/Info.plist" \
+            | tee output/bundle-id.txt
 
-          FRAMEWORK_PLIST="$APP/Frameworks/UnityFramework.framework/Info.plist"
-          if [ -f "$FRAMEWORK_PLIST" ]; then
-            FRAMEWORK_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$FRAMEWORK_PLIST")"
-            echo "UNITYFRAMEWORK_BUNDLE_ID=$FRAMEWORK_ID" | tee -a output/bundle-id.txt
-          fi
-
-      - name: Upload first unsigned IPA
+      - name: Upload v4 unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v3-UNSIGNED
-          path: Granny-Legacy-iOS-v3-UNSIGNED.ipa
+          name: Granny-Legacy-iOS-v4-UNSIGNED
+          path: Granny-Legacy-iOS-v4-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload Xcode project
-        if: steps.locate_xcode.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Granny-Legacy-iOS-v3-Xcode
-          path: xcode-output/GrannyLegacy-iOS
-          if-no-files-found: warn
-          compression-level: 6
-
-      - name: Upload v2 diagnostics
+      - name: Upload v4 build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v3-Diagnostics
+          name: Granny-Legacy-iOS-v4-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -538,18 +1058,17 @@ jobs:
           echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
 
           if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
-            echo "V3 RESULT: Unity recovered project does not compile/export yet."
-            echo "Download Granny-Legacy-iOS-v3-Diagnostics and inspect error-summary.txt."
+            echo "V4 RESULT: recovered gameplay code did not compile yet."
+            echo "Use Granny-Legacy-iOS-v4-Build-Diagnostics for the next fix."
             exit 1
           fi
 
           if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
-            echo "V3 RESULT: Unity exported Xcode, but Xcode build failed."
-            echo "Download Granny-Legacy-iOS-v3-Diagnostics."
+            echo "V4 RESULT: Unity export passed, but Xcode build failed."
             exit 1
           fi
 
-          echo "V3 RESULT: FIRST UNSIGNED IPA CREATED."
+          echo "V4 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
 
       - name: Return Unity license
         if: always()
