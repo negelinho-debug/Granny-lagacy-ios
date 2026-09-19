@@ -1,4 +1,4 @@
-name: Granny Legacy iOS - v4 LOGIC RECOVERY + ORIGINAL ICON
+name: Granny Legacy iOS - v5 BROKEN PIPE FIX + LOGIC RECOVERY
 
 on:
   workflow_dispatch:
@@ -183,7 +183,7 @@ jobs:
               -iname '*Linux*.zip' \
               ! -iname '*ARM64*' \
               ! -iname '*aarch64*' \
-              | head -1 || true
+              | sed -n '1p' || true
           )"
 
           if [ -n "$ZIP" ]; then
@@ -195,7 +195,7 @@ jobs:
                 ! -iname '*.zip' \
                 ! -iname '*ARM64*' \
                 ! -iname '*aarch64*' \
-                | head -1 || true
+                | sed -n '1p' || true
             )"
 
             if [ -z "$BIN" ]; then
@@ -209,7 +209,7 @@ jobs:
           CPP2IL="$(
             find tools/cpp2il -type f \
               \( -name 'Cpp2IL' -o -iname 'cpp2il' -o -iname 'Cpp2IL-*Linux*' \) \
-              | head -1 || true
+              | sed -n '1p' || true
           )"
 
           if [ -z "$CPP2IL" ]; then
@@ -266,12 +266,12 @@ jobs:
           echo "===== CPP2IL OUTPUT ====="
           find output/cpp2il-recovered -type f -printf '%s %p\n' \
             | sort -nr \
-            | head -200
+            | sed -n '1,200p'
 
           ASSEMBLY="$(
             find output/cpp2il-recovered -type f \
               -iname 'Assembly-CSharp.dll' \
-              | head -1 || true
+              | sed -n '1p' || true
           )"
 
           if [ -z "$ASSEMBLY" ]; then
@@ -344,7 +344,8 @@ jobs:
             exit 1
           fi
 
-          find "$DEST" -type f -name '*.cs' | head -200 > output/decompiled-files-sample.txt
+          find "$DEST" -type f -name '*.cs' -print > output/decompiled-files-all.txt
+          sed -n '1,200p' output/decompiled-files-all.txt > output/decompiled-files-sample.txt
 
       - name: Download AssetRipper 2.0.0
         shell: bash
@@ -358,14 +359,14 @@ jobs:
           ASSET="$(
             grep -Ei '^AssetRipper_linux_(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
               output/assetripper-assets.txt \
-              | head -1 || true
+              | sed -n '1p' || true
           )"
 
           if [ -z "$ASSET" ]; then
             ASSET="$(
               grep -Ei 'linux.*(x64|amd64|64).*(\.tar\.xz|\.zip)$' \
                 output/assetripper-assets.txt \
-                | head -1 || true
+                | sed -n '1p' || true
             )"
           fi
 
@@ -390,7 +391,7 @@ jobs:
           RIPPER="$(
             find tools/assetripper -type f \
               \( -name AssetRipper.GUI.Free -o -name AssetRipper.GUI -o -name AssetRipper \) \
-              | head -1
+              | sed -n '1p'
           )"
 
           if [ -z "$RIPPER" ]; then
@@ -676,7 +677,7 @@ jobs:
                   );
 
                   Debug.Log(
-                      "GRANNY LEGACY v4 BUILD RESULT=" + report.summary.result +
+                      "GRANNY LEGACY v5 BUILD RESULT=" + report.summary.result +
                       " errors=" + report.summary.totalErrors +
                       " warnings=" + report.summary.totalWarnings
                   );
@@ -707,7 +708,7 @@ jobs:
       - name: Upload logic-recovered Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v4-Recovered-Logic-Project
+          name: Granny-Legacy-v5-Recovered-Logic-Project
           path: recovered-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -716,7 +717,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v4-Logic-Diagnostics
+          name: Granny-Legacy-v5-Logic-Diagnostics
           path: |
             output/cpp2il-recovery.log
             output/cpp2il-summary.txt
@@ -744,10 +745,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download recovered v4 project
+      - name: Download recovered v5 project
         uses: actions/download-artifact@v4
         with:
-          name: Granny-Legacy-v4-Recovered-Logic-Project
+          name: Granny-Legacy-v5-Recovered-Logic-Project
           path: recovered-download
 
       - name: Extract recovered project
@@ -872,7 +873,7 @@ jobs:
             find "$INSTALL_ROOT" -type f \
               -path '*/Unity.app/Contents/MacOS/Unity' \
               -print \
-              | head -1
+              | sed -n '1p'
           )"
 
           test -x "$UNITY_BIN"
@@ -925,14 +926,14 @@ jobs:
 
           PROJ="$(
             find "$PWD" -type d -name 'Unity-iPhone.xcodeproj' -print 2>/dev/null \
-              | head -1 || true
+              | sed -n '1p' || true
           )"
 
           if [ -z "$PROJ" ]; then
             PROJ="$(
               find "$PWD" -type d -name '*.xcodeproj' -print 2>/dev/null \
                 | grep -v '/DerivedData/' \
-                | head -1 || true
+                | sed -n '1p' || true
             )"
           fi
 
@@ -1010,7 +1011,7 @@ jobs:
             find "$PWD/DerivedData/Build/Products" \
               -type d -name '*.app' \
               -path '*Release-iphoneos*' \
-              | head -1
+              | sed -n '1p'
           )"
 
           if [ -z "$APP" ]; then
@@ -1022,9 +1023,9 @@ jobs:
           mkdir Payload
           cp -R "$APP" Payload/
 
-          /usr/bin/zip -qry Granny-Legacy-iOS-v4-UNSIGNED.ipa Payload
+          /usr/bin/zip -qry Granny-Legacy-iOS-v5-UNSIGNED.ipa Payload
 
-          ls -lh Granny-Legacy-iOS-v4-UNSIGNED.ipa
+          ls -lh Granny-Legacy-iOS-v5-UNSIGNED.ipa
 
           /usr/libexec/PlistBuddy \
             -c 'Print :CFBundleIdentifier' \
@@ -1035,8 +1036,8 @@ jobs:
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v4-UNSIGNED
-          path: Granny-Legacy-iOS-v4-UNSIGNED.ipa
+          name: Granny-Legacy-iOS-v5-UNSIGNED
+          path: Granny-Legacy-iOS-v5-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -1044,7 +1045,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v4-Build-Diagnostics
+          name: Granny-Legacy-iOS-v5-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -1058,17 +1059,17 @@ jobs:
           echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
 
           if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
-            echo "V4 RESULT: recovered gameplay code did not compile yet."
-            echo "Use Granny-Legacy-iOS-v4-Build-Diagnostics for the next fix."
+            echo "V5 RESULT: recovered gameplay code did not compile yet."
+            echo "Use Granny-Legacy-iOS-v5-Build-Diagnostics for the next fix."
             exit 1
           fi
 
           if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
-            echo "V4 RESULT: Unity export passed, but Xcode build failed."
+            echo "V5 RESULT: Unity export passed, but Xcode build failed."
             exit 1
           fi
 
-          echo "V4 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
+          echo "V5 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
 
       - name: Return Unity license
         if: always()
