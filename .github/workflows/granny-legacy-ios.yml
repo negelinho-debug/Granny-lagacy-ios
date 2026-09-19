@@ -1,4 +1,4 @@
-name: Granny Legacy iOS - v9 EVENTSYSTEMS FULL-QUALIFY FIX
+name: Granny Legacy iOS - v10 TARGETED EVENTSYSTEMS FIX
 
 on:
   workflow_dispatch:
@@ -789,56 +789,120 @@ jobs:
           print("GENERATED_DUPLICATES_REMOVED", len(removed))
           PY
 
-      - name: Force-fix Unity EventSystems interfaces in recovered gameplay scripts
+      - name: Targeted EventSystems fix for gameplay UI only
         shell: bash
         run: |
           set -euo pipefail
+
           PROJECT="$(cat output/project-path.txt)"
           export PROJECT
 
           python3 - <<'PY'
-          import os, re
+          import os
+          import re
           from pathlib import Path
 
           assets = Path(os.environ["PROJECT"]) / "Assets"
-          names = [
-              "IPointerDownHandler","IPointerUpHandler","IPointerEnterHandler",
-              "IPointerExitHandler","IPointerClickHandler","IDragHandler",
-              "IBeginDragHandler","IEndDragHandler","IInitializePotentialDragHandler",
-              "IScrollHandler","ISelectHandler","IDeselectHandler","IMoveHandler",
-              "ISubmitHandler","ICancelHandler","IEventSystemHandler",
-              "PointerEventData","BaseEventData","AxisEventData"
+
+          # IMPORTANT:
+          # v9 failed because a broad replacement touched UnityEngine.UI's own
+          # EventSystems source files and turned declarations such as
+          # "class PointerEventData" into invalid qualified declarations.
+          #
+          # v10 starts again from the clean v8 logic and ONLY patches these
+          # recovered Granny gameplay UI scripts.
+          target_names = {
+              "HeldUI.cs",
+              "HoverTextActivato.cs",
+              "Joystick.cs",
+          }
+
+          interface_names = [
+              "IPointerDownHandler",
+              "IPointerUpHandler",
+              "IPointerEnterHandler",
+              "IPointerExitHandler",
+              "IPointerClickHandler",
+              "IDragHandler",
+              "IBeginDragHandler",
+              "IEndDragHandler",
+              "IInitializePotentialDragHandler",
+          ]
+
+          event_data_names = [
+              "PointerEventData",
+              "BaseEventData",
+              "AxisEventData",
           ]
 
           changed = []
+
           for p in assets.rglob("*.cs"):
-              parts = {x.lower() for x in p.parts}
-              if "tmpro" in parts or "examples" in parts:
+              if p.name not in target_names:
                   continue
 
-              try:
-                  s = p.read_text(encoding="utf-8", errors="ignore")
-              except Exception:
+              # Only the real game assembly, never UnityEngine.UI/TMP copies.
+              posix = p.as_posix().lower()
+              if "/unityengine.ui/" in posix or "/tmpro/" in posix:
                   continue
 
-              old = s
-              for short in names:
+              s = p.read_text(encoding="utf-8", errors="ignore")
+              original = s
+
+              # Remove Cpp2IL's redundant IEventSystemHandler from inheritance.
+              # Pointer/drag interfaces inherit it already.
+              s = re.sub(
+                  r',\s*(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\b',
+                  '',
+                  s
+              )
+              s = re.sub(
+                  r'(?:UnityEngine\.EventSystems\.)?IEventSystemHandler\s*,\s*',
+                  '',
+                  s
+              )
+
+              # Fully qualify only interface references in these three gameplay files.
+              for short in interface_names:
                   full = "UnityEngine.EventSystems." + short
-                  s = re.sub(rf'(?<![\w.]){re.escape(short)}\b', full, s)
+                  s = re.sub(
+                      rf'(?<![\w.]){re.escape(short)}\b',
+                      full,
+                      s
+                  )
 
+              for short in event_data_names:
+                  full = "UnityEngine.EventSystems." + short
+                  s = re.sub(
+                      rf'(?<![\w.]){re.escape(short)}\b',
+                      full,
+                      s
+                  )
+
+              # Clean accidental duplicates if a using/previous compatibility pass
+              # already qualified something.
               s = s.replace(
                   "UnityEngine.EventSystems.UnityEngine.EventSystems.",
                   "UnityEngine.EventSystems."
               )
 
-              if s != old:
+              if s != original:
                   p.write_text(s, encoding="utf-8")
                   changed.append(str(p))
 
-          Path("output/v9-eventsystems-changed.txt").write_text(
-              "\n".join(changed), encoding="utf-8"
+          Path("output/v10-targeted-eventsystems.txt").write_text(
+              "\n".join(changed),
+              encoding="utf-8"
           )
-          print("EVENTSYSTEMS_FULLQUALIFIED_FILES", len(changed))
+
+          print("TARGETED_EVENTSYSTEMS_FILES", len(changed))
+          for x in changed:
+              print("PATCHED", x)
+
+          # We expect these three game UI scripts to exist in this build.
+          # If none were patched, stop before wasting another macOS build.
+          if not changed:
+              raise SystemExit("No Granny gameplay UI EventSystems scripts were patched.")
           PY
 
       - name: Add original icon + iOS build script
@@ -954,7 +1018,7 @@ jobs:
                   );
 
                   Debug.Log(
-                      "GRANNY LEGACY v9 BUILD RESULT=" + report.summary.result +
+                      "GRANNY LEGACY v10 BUILD RESULT=" + report.summary.result +
                       " errors=" + report.summary.totalErrors +
                       " warnings=" + report.summary.totalWarnings
                   );
@@ -985,7 +1049,7 @@ jobs:
       - name: Upload logic-recovered Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v9-Recovered-Logic-Project
+          name: Granny-Legacy-v10-Recovered-Logic-Project
           path: recovered-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -994,7 +1058,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v9-Logic-Diagnostics
+          name: Granny-Legacy-v10-Logic-Diagnostics
           path: |
             output/cpp2il-recovery.log
             output/cpp2il-summary.txt
@@ -1004,7 +1068,7 @@ jobs:
             output/added-recovered-types.txt
             output/v8-compat-changed.txt
             output/v8-compat-removed.txt
-            output/v9-eventsystems-changed.txt
+            output/v10-targeted-eventsystems.txt
             output/ilspy.log
             output/ilspy-failures.txt
             output/assetripper.log
@@ -1012,7 +1076,7 @@ jobs:
           compression-level: 6
 
   build_ios:
-    name: Build Granny Legacy v9 iOS IPA
+    name: Build Granny Legacy v10 iOS IPA
     needs: recover_logic
     runs-on: macos-latest
     timeout-minutes: 180
@@ -1029,7 +1093,7 @@ jobs:
       - name: Download recovered v6 project
         uses: actions/download-artifact@v4
         with:
-          name: Granny-Legacy-v9-Recovered-Logic-Project
+          name: Granny-Legacy-v10-Recovered-Logic-Project
           path: recovered-download
 
       - name: Extract recovered project
@@ -1282,7 +1346,7 @@ jobs:
           echo "$RC" > output/xcode-exit-code.txt
           exit "$RC"
 
-      - name: Package unsigned v9 IPA
+      - name: Package unsigned v10 IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         shell: bash
         run: |
@@ -1304,29 +1368,29 @@ jobs:
           mkdir Payload
           cp -R "$APP" Payload/
 
-          /usr/bin/zip -qry Granny-Legacy-iOS-v9-UNSIGNED.ipa Payload
+          /usr/bin/zip -qry Granny-Legacy-iOS-v10-UNSIGNED.ipa Payload
 
-          ls -lh Granny-Legacy-iOS-v9-UNSIGNED.ipa
+          ls -lh Granny-Legacy-iOS-v10-UNSIGNED.ipa
 
           /usr/libexec/PlistBuddy \
             -c 'Print :CFBundleIdentifier' \
             "$APP/Info.plist" \
             | tee output/bundle-id.txt
 
-      - name: Upload v9 unsigned IPA
+      - name: Upload v10 unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v9-UNSIGNED
-          path: Granny-Legacy-iOS-v9-UNSIGNED.ipa
+          name: Granny-Legacy-iOS-v10-UNSIGNED
+          path: Granny-Legacy-iOS-v10-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload v9 build diagnostics
+      - name: Upload v10 build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v9-Build-Diagnostics
+          name: Granny-Legacy-iOS-v10-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -1340,17 +1404,17 @@ jobs:
           echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
 
           if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
-            echo "V9 RESULT: recovered gameplay code did not compile yet."
-            echo "Use Granny-Legacy-iOS-v9-Build-Diagnostics for the next fix."
+            echo "V10 RESULT: recovered gameplay code did not compile yet."
+            echo "Use Granny-Legacy-iOS-v10-Build-Diagnostics for the next fix."
             exit 1
           fi
 
           if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
-            echo "V9 RESULT: Unity export passed, but Xcode build failed."
+            echo "V10 RESULT: Unity export passed, but Xcode build failed."
             exit 1
           fi
 
-          echo "V9 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
+          echo "V10 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
 
       - name: Return Unity license
         if: always()
