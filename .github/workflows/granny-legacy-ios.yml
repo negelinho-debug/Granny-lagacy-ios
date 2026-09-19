@@ -1,4 +1,4 @@
-name: Granny Legacy iOS - v6 GAMEPLAY-ONLY LOGIC MERGE
+name: Granny Legacy iOS - v7 MISSING TYPES FIX
 
 on:
   workflow_dispatch:
@@ -491,67 +491,138 @@ jobs:
           assets = project / "Assets"
           decomp = Path("output/decompiled")
 
-          # v5 replaced vendor/plugin sources too (GameJolt, ootii, Bakery, ProBuilder).
-          # ILSpy emitted C# 10 file-scoped namespaces for those, while Unity 2022.3
-          # compiles scripts as C# 9. AssetRipper's original vendor stubs already
-          # compiled successfully in v3, so v6 restores ONLY Assembly-CSharp logic.
-          allowed_roots = {
-              decomp / "Assembly-CSharp",
-              decomp / "Assembly-CSharp-firstpass",
+          roots = {
+              "Assembly-CSharp": decomp / "Assembly-CSharp",
+              "Assembly-CSharp-firstpass": decomp / "Assembly-CSharp-firstpass",
           }
-
-          sources = []
-          for root in allowed_roots:
-              if root.exists():
-                  sources.extend(root.rglob("*.cs"))
 
           targets = defaultdict(list)
           for p in assets.rglob("*.cs"):
               targets[p.stem.lower()].append(p)
 
           patched = []
+          added = []
           skipped_ambiguous = []
-          missing = []
+          skipped_unsafe = []
 
           def downgrade_file_scoped_namespace(content: str) -> str:
-              # Unity 2022.3/C#9 cannot compile: namespace Foo.Bar;
-              # Turn the first file-scoped namespace into a normal block namespace.
               m = re.search(r'(?m)^(\s*)namespace\s+([A-Za-z_][\w.]*)\s*;\s*$', content)
               if not m:
                   return content
 
               indent, ns = m.group(1), m.group(2)
-              content = content[:m.start()] + f"{indent}namespace {ns}\n{indent}{{" + content[m.end():]
-              content = content.rstrip() + f"\n{indent}}}\n"
-              return content
+              content = (
+                  content[:m.start()]
+                  + f"{indent}namespace {ns}\n{indent}{{"
+                  + content[m.end():]
+              )
+              return content.rstrip() + f"\n{indent}}}\n"
 
-          for src in sources:
-              key = src.stem.lower()
-              matches = targets.get(key, [])
+          def safe_cs_filename(path: Path) -> bool:
+              stem = path.stem
+              if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', stem):
+                  return False
+              if stem in {
+                  "AssemblyInfo",
+                  "GlobalUsings",
+                  "Module",
+                  "PrivateImplementationDetails",
+              }:
+                  return False
+              return True
 
-              if len(matches) == 1:
-                  dst = matches[0]
+          for asm_name, root in roots.items():
+              if not root.exists():
+                  continue
+
+              for src in root.rglob("*.cs"):
+                  if not safe_cs_filename(src):
+                      skipped_unsafe.append(src)
+                      continue
+
+                  key = src.stem.lower()
+                  matches = targets.get(key, [])
+
                   try:
                       content = src.read_text(encoding="utf-8-sig", errors="replace")
                       content = downgrade_file_scoped_namespace(content)
+                  except Exception as e:
+                      print("READ_FAIL", src, e)
+                      continue
+
+                  if len(matches) == 1:
+                      dst = matches[0]
                       dst.write_text(content, encoding="utf-8")
                       patched.append((src, dst))
-                  except Exception as e:
-                      print("PATCH_FAIL", src, e)
-              elif len(matches) > 1:
-                  skipped_ambiguous.append((src, matches))
-              else:
-                  missing.append(src)
+                      continue
+
+                  if len(matches) > 1:
+                      skipped_ambiguous.append((src, matches))
+                      continue
+
+                  # Important v7 change:
+                  # Cpp2IL/ILSpy often emits enums/helper types as separate files
+                  # that AssetRipper never created. v6 ignored those files.
+                  # That is why WaterBase.cs could not find WaterQuality.
+                  rel = src.relative_to(root)
+
+                  if asm_name == "Assembly-CSharp-firstpass":
+                      dst = assets / "Plugins" / "RecoveredIL" / "Assembly-CSharp-firstpass" / rel
+                  else:
+                      dst = assets / "RecoveredIL" / "Assembly-CSharp" / rel
+
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  dst.write_text(content, encoding="utf-8")
+                  added.append((src, dst))
+                  targets[key].append(dst)
+
+          # Fallback for old Unity Standard Assets Water. If Cpp2IL did not
+          # produce WaterQuality.cs at all, provide the original enum shape
+          # required by WaterBase.cs.
+          waterbase = list(assets.rglob("WaterBase.cs"))
+          waterquality_found = False
+
+          for p in assets.rglob("*.cs"):
+              try:
+                  s = p.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+              if re.search(r'\benum\s+WaterQuality\b', s):
+                  waterquality_found = True
+                  break
+
+          if waterbase and not waterquality_found:
+              fallback = assets / "Plugins" / "RecoveredIL" / "UnityStandardAssets" / "Water" / "WaterQuality.cs"
+              fallback.parent.mkdir(parents=True, exist_ok=True)
+              fallback.write_text(
+                  "namespace UnityStandardAssets.Water\n"
+                  "{\n"
+                  "    public enum WaterQuality\n"
+                  "    {\n"
+                  "        High = 2,\n"
+                  "        Medium = 1,\n"
+                  "        Low = 0\n"
+                  "    }\n"
+                  "}\n",
+                  encoding="utf-8"
+              )
+              added.append((Path("<fallback>"), fallback))
+              print("ADDED FALLBACK WaterQuality.cs ->", fallback)
 
           Path("output/patched-scripts.txt").write_text(
               "\n".join(f"{s} -> {d}" for s, d in patched),
               encoding="utf-8"
           )
+          Path("output/added-recovered-types.txt").write_text(
+              "\n".join(f"{s} -> {d}" for s, d in added),
+              encoding="utf-8"
+          )
 
           Path("output/logic-merge-summary.txt").write_text(
               f"patched={len(patched)}\n"
+              f"added_missing_types={len(added)}\n"
               f"ambiguous={len(skipped_ambiguous)}\n"
-              f"unmatched={len(missing)}\n",
+              f"unsafe_skipped={len(skipped_unsafe)}\n",
               encoding="utf-8"
           )
 
@@ -566,23 +637,25 @@ jobs:
               "grannyrobot",
           }
 
-          patched_names = {d.stem.lower() for _, d in patched}
-          important_patched = sorted(important & patched_names)
+          restored_names = {d.stem.lower() for _, d in patched}
+          restored_names |= {d.stem.lower() for _, d in added}
+          important_restored = sorted(important & restored_names)
 
           Path("output/important-logic.txt").write_text(
-              "\n".join(important_patched),
+              "\n".join(important_restored),
               encoding="utf-8"
           )
 
           print("PATCHED GAMEPLAY SCRIPTS", len(patched))
-          print("IMPORTANT_PATCHED", important_patched)
+          print("ADDED MISSING TYPES", len(added))
+          print("IMPORTANT_RESTORED", important_restored)
 
-          if len(patched) < 20:
+          if len(patched) + len(added) < 20:
               raise SystemExit(
-                  "Too few Assembly-CSharp scripts were recovered; refusing to build another asset-only IPA."
+                  "Too little gameplay code was recovered; refusing to build another asset-only IPA."
               )
 
-          if len(important_patched) < 3:
+          if len(important_restored) < 3:
               raise SystemExit(
                   "Core gameplay scripts were not recovered well enough; refusing to build broken IPA."
               )
@@ -704,7 +777,7 @@ jobs:
                   );
 
                   Debug.Log(
-                      "GRANNY LEGACY v6 BUILD RESULT=" + report.summary.result +
+                      "GRANNY LEGACY v7 BUILD RESULT=" + report.summary.result +
                       " errors=" + report.summary.totalErrors +
                       " warnings=" + report.summary.totalWarnings
                   );
@@ -735,7 +808,7 @@ jobs:
       - name: Upload logic-recovered Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v6-Recovered-Logic-Project
+          name: Granny-Legacy-v7-Recovered-Logic-Project
           path: recovered-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -744,13 +817,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v6-Logic-Diagnostics
+          name: Granny-Legacy-v7-Logic-Diagnostics
           path: |
             output/cpp2il-recovery.log
             output/cpp2il-summary.txt
             output/logic-merge-summary.txt
             output/important-logic.txt
             output/patched-scripts.txt
+            output/added-recovered-types.txt
             output/ilspy.log
             output/ilspy-failures.txt
             output/assetripper.log
@@ -758,7 +832,7 @@ jobs:
           compression-level: 6
 
   build_ios:
-    name: Build Granny Legacy v6 iOS IPA
+    name: Build Granny Legacy v7 iOS IPA
     needs: recover_logic
     runs-on: macos-latest
     timeout-minutes: 180
@@ -775,7 +849,7 @@ jobs:
       - name: Download recovered v6 project
         uses: actions/download-artifact@v4
         with:
-          name: Granny-Legacy-v6-Recovered-Logic-Project
+          name: Granny-Legacy-v7-Recovered-Logic-Project
           path: recovered-download
 
       - name: Extract recovered project
@@ -1028,7 +1102,7 @@ jobs:
           echo "$RC" > output/xcode-exit-code.txt
           exit "$RC"
 
-      - name: Package unsigned v6 IPA
+      - name: Package unsigned v7 IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         shell: bash
         run: |
@@ -1050,29 +1124,29 @@ jobs:
           mkdir Payload
           cp -R "$APP" Payload/
 
-          /usr/bin/zip -qry Granny-Legacy-iOS-v6-UNSIGNED.ipa Payload
+          /usr/bin/zip -qry Granny-Legacy-iOS-v7-UNSIGNED.ipa Payload
 
-          ls -lh Granny-Legacy-iOS-v6-UNSIGNED.ipa
+          ls -lh Granny-Legacy-iOS-v7-UNSIGNED.ipa
 
           /usr/libexec/PlistBuddy \
             -c 'Print :CFBundleIdentifier' \
             "$APP/Info.plist" \
             | tee output/bundle-id.txt
 
-      - name: Upload v6 unsigned IPA
+      - name: Upload v7 unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v6-UNSIGNED
-          path: Granny-Legacy-iOS-v6-UNSIGNED.ipa
+          name: Granny-Legacy-iOS-v7-UNSIGNED
+          path: Granny-Legacy-iOS-v7-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload v6 build diagnostics
+      - name: Upload v7 build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v6-Build-Diagnostics
+          name: Granny-Legacy-iOS-v7-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -1086,17 +1160,17 @@ jobs:
           echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
 
           if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
-            echo "V6 RESULT: recovered gameplay code did not compile yet."
-            echo "Use Granny-Legacy-iOS-v6-Build-Diagnostics for the next fix."
+            echo "V7 RESULT: recovered gameplay code did not compile yet."
+            echo "Use Granny-Legacy-iOS-v7-Build-Diagnostics for the next fix."
             exit 1
           fi
 
           if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
-            echo "V6 RESULT: Unity export passed, but Xcode build failed."
+            echo "V7 RESULT: Unity export passed, but Xcode build failed."
             exit 1
           fi
 
-          echo "V6 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
+          echo "V7 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
 
       - name: Return Unity license
         if: always()
