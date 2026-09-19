@@ -1,4 +1,4 @@
-name: Granny Legacy iOS - v5 BROKEN PIPE FIX + LOGIC RECOVERY
+name: Granny Legacy iOS - v6 GAMEPLAY-ONLY LOGIC MERGE
 
 on:
   workflow_dispatch:
@@ -313,34 +313,36 @@ jobs:
 
           COUNT=0
 
-          while IFS= read -r DLL; do
-            BASE="$(basename "$DLL")"
+          for NAME in Assembly-CSharp Assembly-CSharp-firstpass; do
+            DLL="$(
+              find "$ROOT" -type f -name "${NAME}.dll" -print \
+                | sed -n '1p'
+            )"
 
-            case "$BASE" in
-              Unity*.dll|System*.dll|mscorlib.dll|netstandard.dll|Il2CppDummyDll.dll)
-                continue
-                ;;
-            esac
+            if [ -z "$DLL" ] || [ ! -f "$DLL" ]; then
+              echo "INFO: ${NAME}.dll was not produced by Cpp2IL."
+              continue
+            fi
 
-            NAME="${BASE%.dll}"
             OUT="$DEST/$NAME"
             mkdir -p "$OUT"
 
-            echo "DECOMPILE: $BASE"
+            echo "DECOMPILE GAMEPLAY ONLY: $(basename "$DLL")"
 
             if "$ILSPY" -p -o "$OUT" "$DLL" \
               >> output/ilspy.log 2>&1; then
               COUNT=$((COUNT + 1))
             else
-              echo "WARNING: ILSpy failed for $BASE" | tee -a output/ilspy-failures.txt
+              echo "WARNING: ILSpy failed for $(basename "$DLL")" \
+                | tee -a output/ilspy-failures.txt
             fi
-          done < <(find "$ROOT" -type f -name '*.dll' | sort)
+          done
 
-          echo "DECOMPILED_ASSEMBLIES=$COUNT"
+          echo "DECOMPILED_GAMEPLAY_ASSEMBLIES=$COUNT"
           echo "$COUNT" > output/decompiled-assembly-count.txt
 
           if [ "$COUNT" -lt 1 ]; then
-            echo "ERROR: No gameplay assembly could be decompiled."
+            echo "ERROR: Assembly-CSharp could not be decompiled."
             exit 1
           fi
 
@@ -481,12 +483,27 @@ jobs:
 
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
           from collections import defaultdict
 
           project = Path(os.environ["PROJECT"])
           assets = project / "Assets"
           decomp = Path("output/decompiled")
+
+          # v5 replaced vendor/plugin sources too (GameJolt, ootii, Bakery, ProBuilder).
+          # ILSpy emitted C# 10 file-scoped namespaces for those, while Unity 2022.3
+          # compiles scripts as C# 9. AssetRipper's original vendor stubs already
+          # compiled successfully in v3, so v6 restores ONLY Assembly-CSharp logic.
+          allowed_roots = {
+              decomp / "Assembly-CSharp",
+              decomp / "Assembly-CSharp-firstpass",
+          }
+
+          sources = []
+          for root in allowed_roots:
+              if root.exists():
+                  sources.extend(root.rglob("*.cs"))
 
           targets = defaultdict(list)
           for p in assets.rglob("*.cs"):
@@ -496,7 +513,19 @@ jobs:
           skipped_ambiguous = []
           missing = []
 
-          for src in decomp.rglob("*.cs"):
+          def downgrade_file_scoped_namespace(content: str) -> str:
+              # Unity 2022.3/C#9 cannot compile: namespace Foo.Bar;
+              # Turn the first file-scoped namespace into a normal block namespace.
+              m = re.search(r'(?m)^(\s*)namespace\s+([A-Za-z_][\w.]*)\s*;\s*$', content)
+              if not m:
+                  return content
+
+              indent, ns = m.group(1), m.group(2)
+              content = content[:m.start()] + f"{indent}namespace {ns}\n{indent}{{" + content[m.end():]
+              content = content.rstrip() + f"\n{indent}}}\n"
+              return content
+
+          for src in sources:
               key = src.stem.lower()
               matches = targets.get(key, [])
 
@@ -504,12 +533,7 @@ jobs:
                   dst = matches[0]
                   try:
                       content = src.read_text(encoding="utf-8-sig", errors="replace")
-
-                      # Strip decompiler/compiler generated project-level noise that should not
-                      # replace Unity scripts. Keep normal class files only.
-                      if "namespace Properties" in content and "AssemblyInfo" in src.name:
-                          continue
-
+                      content = downgrade_file_scoped_namespace(content)
                       dst.write_text(content, encoding="utf-8")
                       patched.append((src, dst))
                   except Exception as e:
@@ -550,15 +574,18 @@ jobs:
               encoding="utf-8"
           )
 
-          print("PATCHED", len(patched))
+          print("PATCHED GAMEPLAY SCRIPTS", len(patched))
           print("IMPORTANT_PATCHED", important_patched)
 
-          # Do not waste another IPA build if essentially no gameplay code was merged.
           if len(patched) < 20:
-              raise SystemExit("Too few recovered scripts were merged; refusing to build another asset-only IPA.")
+              raise SystemExit(
+                  "Too few Assembly-CSharp scripts were recovered; refusing to build another asset-only IPA."
+              )
 
           if len(important_patched) < 3:
-              raise SystemExit("Core gameplay scripts were not recovered well enough; refusing to build broken IPA.")
+              raise SystemExit(
+                  "Core gameplay scripts were not recovered well enough; refusing to build broken IPA."
+              )
           PY
 
           cat output/logic-merge-summary.txt
@@ -677,7 +704,7 @@ jobs:
                   );
 
                   Debug.Log(
-                      "GRANNY LEGACY v5 BUILD RESULT=" + report.summary.result +
+                      "GRANNY LEGACY v6 BUILD RESULT=" + report.summary.result +
                       " errors=" + report.summary.totalErrors +
                       " warnings=" + report.summary.totalWarnings
                   );
@@ -708,7 +735,7 @@ jobs:
       - name: Upload logic-recovered Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v5-Recovered-Logic-Project
+          name: Granny-Legacy-v6-Recovered-Logic-Project
           path: recovered-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -717,7 +744,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v5-Logic-Diagnostics
+          name: Granny-Legacy-v6-Logic-Diagnostics
           path: |
             output/cpp2il-recovery.log
             output/cpp2il-summary.txt
@@ -731,7 +758,7 @@ jobs:
           compression-level: 6
 
   build_ios:
-    name: Build Granny Legacy v4 iOS IPA
+    name: Build Granny Legacy v6 iOS IPA
     needs: recover_logic
     runs-on: macos-latest
     timeout-minutes: 180
@@ -745,10 +772,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download recovered v5 project
+      - name: Download recovered v6 project
         uses: actions/download-artifact@v4
         with:
-          name: Granny-Legacy-v5-Recovered-Logic-Project
+          name: Granny-Legacy-v6-Recovered-Logic-Project
           path: recovered-download
 
       - name: Extract recovered project
@@ -1001,7 +1028,7 @@ jobs:
           echo "$RC" > output/xcode-exit-code.txt
           exit "$RC"
 
-      - name: Package unsigned v4 IPA
+      - name: Package unsigned v6 IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         shell: bash
         run: |
@@ -1023,29 +1050,29 @@ jobs:
           mkdir Payload
           cp -R "$APP" Payload/
 
-          /usr/bin/zip -qry Granny-Legacy-iOS-v5-UNSIGNED.ipa Payload
+          /usr/bin/zip -qry Granny-Legacy-iOS-v6-UNSIGNED.ipa Payload
 
-          ls -lh Granny-Legacy-iOS-v5-UNSIGNED.ipa
+          ls -lh Granny-Legacy-iOS-v6-UNSIGNED.ipa
 
           /usr/libexec/PlistBuddy \
             -c 'Print :CFBundleIdentifier' \
             "$APP/Info.plist" \
             | tee output/bundle-id.txt
 
-      - name: Upload v4 unsigned IPA
+      - name: Upload v6 unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v5-UNSIGNED
-          path: Granny-Legacy-iOS-v5-UNSIGNED.ipa
+          name: Granny-Legacy-iOS-v6-UNSIGNED
+          path: Granny-Legacy-iOS-v6-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload v4 build diagnostics
+      - name: Upload v6 build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v5-Build-Diagnostics
+          name: Granny-Legacy-iOS-v6-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -1059,17 +1086,17 @@ jobs:
           echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
 
           if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
-            echo "V5 RESULT: recovered gameplay code did not compile yet."
-            echo "Use Granny-Legacy-iOS-v5-Build-Diagnostics for the next fix."
+            echo "V6 RESULT: recovered gameplay code did not compile yet."
+            echo "Use Granny-Legacy-iOS-v6-Build-Diagnostics for the next fix."
             exit 1
           fi
 
           if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
-            echo "V5 RESULT: Unity export passed, but Xcode build failed."
+            echo "V6 RESULT: Unity export passed, but Xcode build failed."
             exit 1
           fi
 
-          echo "V5 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
+          echo "V6 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
 
       - name: Return Unity license
         if: always()
