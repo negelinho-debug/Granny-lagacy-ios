@@ -1,4 +1,4 @@
-name: Granny Legacy iOS - v8 COMPILER COMPAT FIX
+name: Granny Legacy iOS - v9 EVENTSYSTEMS FULL-QUALIFY FIX
 
 on:
   workflow_dispatch:
@@ -789,6 +789,58 @@ jobs:
           print("GENERATED_DUPLICATES_REMOVED", len(removed))
           PY
 
+      - name: Force-fix Unity EventSystems interfaces in recovered gameplay scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$(cat output/project-path.txt)"
+          export PROJECT
+
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          assets = Path(os.environ["PROJECT"]) / "Assets"
+          names = [
+              "IPointerDownHandler","IPointerUpHandler","IPointerEnterHandler",
+              "IPointerExitHandler","IPointerClickHandler","IDragHandler",
+              "IBeginDragHandler","IEndDragHandler","IInitializePotentialDragHandler",
+              "IScrollHandler","ISelectHandler","IDeselectHandler","IMoveHandler",
+              "ISubmitHandler","ICancelHandler","IEventSystemHandler",
+              "PointerEventData","BaseEventData","AxisEventData"
+          ]
+
+          changed = []
+          for p in assets.rglob("*.cs"):
+              parts = {x.lower() for x in p.parts}
+              if "tmpro" in parts or "examples" in parts:
+                  continue
+
+              try:
+                  s = p.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+
+              old = s
+              for short in names:
+                  full = "UnityEngine.EventSystems." + short
+                  s = re.sub(rf'(?<![\w.]){re.escape(short)}\b', full, s)
+
+              s = s.replace(
+                  "UnityEngine.EventSystems.UnityEngine.EventSystems.",
+                  "UnityEngine.EventSystems."
+              )
+
+              if s != old:
+                  p.write_text(s, encoding="utf-8")
+                  changed.append(str(p))
+
+          Path("output/v9-eventsystems-changed.txt").write_text(
+              "\n".join(changed), encoding="utf-8"
+          )
+          print("EVENTSYSTEMS_FULLQUALIFIED_FILES", len(changed))
+          PY
+
       - name: Add original icon + iOS build script
         shell: bash
         run: |
@@ -902,7 +954,7 @@ jobs:
                   );
 
                   Debug.Log(
-                      "GRANNY LEGACY v8 BUILD RESULT=" + report.summary.result +
+                      "GRANNY LEGACY v9 BUILD RESULT=" + report.summary.result +
                       " errors=" + report.summary.totalErrors +
                       " warnings=" + report.summary.totalWarnings
                   );
@@ -933,7 +985,7 @@ jobs:
       - name: Upload logic-recovered Unity project
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v8-Recovered-Logic-Project
+          name: Granny-Legacy-v9-Recovered-Logic-Project
           path: recovered-project.tar.gz
           if-no-files-found: error
           compression-level: 0
@@ -942,7 +994,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-v8-Logic-Diagnostics
+          name: Granny-Legacy-v9-Logic-Diagnostics
           path: |
             output/cpp2il-recovery.log
             output/cpp2il-summary.txt
@@ -952,6 +1004,7 @@ jobs:
             output/added-recovered-types.txt
             output/v8-compat-changed.txt
             output/v8-compat-removed.txt
+            output/v9-eventsystems-changed.txt
             output/ilspy.log
             output/ilspy-failures.txt
             output/assetripper.log
@@ -959,7 +1012,7 @@ jobs:
           compression-level: 6
 
   build_ios:
-    name: Build Granny Legacy v8 iOS IPA
+    name: Build Granny Legacy v9 iOS IPA
     needs: recover_logic
     runs-on: macos-latest
     timeout-minutes: 180
@@ -976,7 +1029,7 @@ jobs:
       - name: Download recovered v6 project
         uses: actions/download-artifact@v4
         with:
-          name: Granny-Legacy-v8-Recovered-Logic-Project
+          name: Granny-Legacy-v9-Recovered-Logic-Project
           path: recovered-download
 
       - name: Extract recovered project
@@ -1229,7 +1282,7 @@ jobs:
           echo "$RC" > output/xcode-exit-code.txt
           exit "$RC"
 
-      - name: Package unsigned v8 IPA
+      - name: Package unsigned v9 IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         shell: bash
         run: |
@@ -1251,29 +1304,29 @@ jobs:
           mkdir Payload
           cp -R "$APP" Payload/
 
-          /usr/bin/zip -qry Granny-Legacy-iOS-v8-UNSIGNED.ipa Payload
+          /usr/bin/zip -qry Granny-Legacy-iOS-v9-UNSIGNED.ipa Payload
 
-          ls -lh Granny-Legacy-iOS-v8-UNSIGNED.ipa
+          ls -lh Granny-Legacy-iOS-v9-UNSIGNED.ipa
 
           /usr/libexec/PlistBuddy \
             -c 'Print :CFBundleIdentifier' \
             "$APP/Info.plist" \
             | tee output/bundle-id.txt
 
-      - name: Upload v8 unsigned IPA
+      - name: Upload v9 unsigned IPA
         if: steps.unity_build.outcome == 'success' && steps.xcode_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v8-UNSIGNED
-          path: Granny-Legacy-iOS-v8-UNSIGNED.ipa
+          name: Granny-Legacy-iOS-v9-UNSIGNED
+          path: Granny-Legacy-iOS-v9-UNSIGNED.ipa
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload v8 build diagnostics
+      - name: Upload v9 build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Granny-Legacy-iOS-v8-Build-Diagnostics
+          name: Granny-Legacy-iOS-v9-Build-Diagnostics
           path: |
             output
           if-no-files-found: warn
@@ -1287,17 +1340,17 @@ jobs:
           echo "Xcode outcome: ${{ steps.xcode_build.outcome }}"
 
           if [ "${{ steps.unity_build.outcome }}" != "success" ]; then
-            echo "V8 RESULT: recovered gameplay code did not compile yet."
-            echo "Use Granny-Legacy-iOS-v8-Build-Diagnostics for the next fix."
+            echo "V9 RESULT: recovered gameplay code did not compile yet."
+            echo "Use Granny-Legacy-iOS-v9-Build-Diagnostics for the next fix."
             exit 1
           fi
 
           if [ "${{ steps.xcode_build.outcome }}" != "success" ]; then
-            echo "V8 RESULT: Unity export passed, but Xcode build failed."
+            echo "V9 RESULT: Unity export passed, but Xcode build failed."
             exit 1
           fi
 
-          echo "V8 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
+          echo "V9 RESULT: unsigned IPA created with recovered gameplay logic + original icon."
 
       - name: Return Unity license
         if: always()
